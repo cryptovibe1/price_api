@@ -31,6 +31,8 @@ mod web_app {
         static LAST_RENDERED_CANDLES: RefCell<Vec<Candle>> = const { RefCell::new(Vec::new()) };
         static CLIENT_VIEW_RANGE: RefCell<Option<(i64, i64)>> = const { RefCell::new(None) };
         static PAN_LAST_X: RefCell<Option<i32>> = const { RefCell::new(None) };
+        static MA_SETTINGS_DRAG: RefCell<Option<(f64, f64)>> = const { RefCell::new(None) };
+        static CONNECTION_SETTINGS_DRAG: RefCell<Option<(f64, f64)>> = const { RefCell::new(None) };
         static CHART_VIEW: RefCell<Option<ChartView>> = const { RefCell::new(None) };
         static RANGE_HISTORY: RefCell<Vec<(i64, i64)>> = const { RefCell::new(Vec::new()) };
     }
@@ -43,6 +45,8 @@ mod web_app {
     const STORAGE_KEY_LOG_SCALE: &str = "price_api.log_scale";
     const STORAGE_KEY_SETTINGS_VISIBLE: &str = "price_api.settings_visible";
     const STORAGE_KEY_SETTINGS_SIDE: &str = "price_api.settings_side";
+    const STORAGE_KEY_CONNECTION_SETTINGS_VISIBLE: &str = "price_api.connection_settings_visible";
+    const STORAGE_KEY_CONNECTION_SETTINGS_SIDE: &str = "price_api.connection_settings_side";
     const MA_COUNT: usize = 7;
 
     #[derive(Clone, Copy)]
@@ -367,7 +371,8 @@ mod web_app {
         let doc = document()?;
         let card = doc
             .get_element_by_id("ma-settings-card")
-            .ok_or_else(|| JsValue::from_str("missing settings card"))?;
+            .ok_or_else(|| JsValue::from_str("missing settings card"))?
+            .dyn_into::<HtmlElement>()?;
         let side_toggle = doc
             .get_element_by_id("settings-side-toggle")
             .ok_or_else(|| JsValue::from_str("missing settings side toggle"))?;
@@ -381,6 +386,10 @@ mod web_app {
             side_toggle.set_text_content(Some("Move Left"));
             storage()?.set_item(STORAGE_KEY_SETTINGS_SIDE, "right")?;
         }
+        let _ = card.style().remove_property("left");
+        let _ = card.style().remove_property("top");
+        let _ = card.style().remove_property("right");
+        let _ = card.style().remove_property("bottom");
         Ok(())
     }
 
@@ -401,6 +410,102 @@ mod web_app {
         let body = doc
             .get_element_by_id("settings-body")
             .ok_or_else(|| JsValue::from_str("missing settings body"))?;
+        Ok(!body.class_name().contains("hidden"))
+    }
+
+    fn connection_settings_class_name(side: &str, collapsed: bool) -> &'static str {
+        match (side == "left", collapsed) {
+            (true, true) => "panel connection-settings-card left collapsed",
+            (true, false) => "panel connection-settings-card left",
+            (false, true) => "panel connection-settings-card collapsed",
+            (false, false) => "panel connection-settings-card",
+        }
+    }
+
+    fn set_connection_settings_visible(visible: bool) -> Result<(), JsValue> {
+        let doc = document()?;
+        let card = doc
+            .get_element_by_id("connection-settings-card")
+            .ok_or_else(|| JsValue::from_str("missing connection settings card"))?;
+        let body = doc
+            .get_element_by_id("connection-settings-body")
+            .ok_or_else(|| JsValue::from_str("missing connection settings body"))?;
+        let toggle = doc
+            .get_element_by_id("connection-settings-toggle")
+            .ok_or_else(|| JsValue::from_str("missing connection settings toggle"))?;
+
+        if visible {
+            body.set_class_name("connection-settings-body");
+            toggle.set_text_content(Some("Hide"));
+            let side = if card.class_name().contains(" left") {
+                "left"
+            } else {
+                "right"
+            };
+            card.set_class_name(connection_settings_class_name(side, false));
+        } else {
+            body.set_class_name("connection-settings-body hidden");
+            toggle.set_text_content(Some("Show"));
+            let side = if card.class_name().contains(" left") {
+                "left"
+            } else {
+                "right"
+            };
+            card.set_class_name(connection_settings_class_name(side, true));
+        }
+
+        storage()?.set_item(
+            STORAGE_KEY_CONNECTION_SETTINGS_VISIBLE,
+            if visible { "1" } else { "0" },
+        )?;
+        Ok(())
+    }
+
+    fn set_connection_settings_side(side: &str) -> Result<(), JsValue> {
+        let doc = document()?;
+        let card = doc
+            .get_element_by_id("connection-settings-card")
+            .ok_or_else(|| JsValue::from_str("missing connection settings card"))?
+            .dyn_into::<HtmlElement>()?;
+        let side_toggle = doc
+            .get_element_by_id("connection-settings-side-toggle")
+            .ok_or_else(|| JsValue::from_str("missing connection settings side toggle"))?;
+
+        let collapsed = card.class_name().contains(" collapsed");
+
+        if side == "left" {
+            card.set_class_name(connection_settings_class_name("left", collapsed));
+            side_toggle.set_text_content(Some("Move Right"));
+            storage()?.set_item(STORAGE_KEY_CONNECTION_SETTINGS_SIDE, "left")?;
+        } else {
+            card.set_class_name(connection_settings_class_name("right", collapsed));
+            side_toggle.set_text_content(Some("Move Left"));
+            storage()?.set_item(STORAGE_KEY_CONNECTION_SETTINGS_SIDE, "right")?;
+        }
+        let _ = card.style().remove_property("left");
+        let _ = card.style().remove_property("top");
+        let _ = card.style().remove_property("right");
+        let _ = card.style().remove_property("bottom");
+        Ok(())
+    }
+
+    fn connection_settings_side() -> Result<String, JsValue> {
+        let doc = document()?;
+        let card = doc
+            .get_element_by_id("connection-settings-card")
+            .ok_or_else(|| JsValue::from_str("missing connection settings card"))?;
+        if card.class_name().contains(" left") {
+            Ok("left".to_string())
+        } else {
+            Ok("right".to_string())
+        }
+    }
+
+    fn connection_settings_visible() -> Result<bool, JsValue> {
+        let doc = document()?;
+        let body = doc
+            .get_element_by_id("connection-settings-body")
+            .ok_or_else(|| JsValue::from_str("missing connection settings body"))?;
         Ok(!body.class_name().contains("hidden"))
     }
 
@@ -489,6 +594,16 @@ mod web_app {
             set_settings_side(&v)?;
         } else {
             set_settings_side("right")?;
+        }
+        if let Some(v) = storage.get_item(STORAGE_KEY_CONNECTION_SETTINGS_VISIBLE)? {
+            set_connection_settings_visible(v == "1")?;
+        } else {
+            set_connection_settings_visible(true)?;
+        }
+        if let Some(v) = storage.get_item(STORAGE_KEY_CONNECTION_SETTINGS_SIDE)? {
+            set_connection_settings_side(&v)?;
+        } else {
+            set_connection_settings_side("left")?;
         }
 
         Ok(())
@@ -1267,6 +1382,26 @@ mod web_app {
         let settings_side_toggle_button = doc
             .get_element_by_id("settings-side-toggle")
             .ok_or_else(|| JsValue::from_str("missing settings side toggle button"))?;
+        let ma_settings_drag_handle = doc
+            .get_element_by_id("ma-settings-drag-handle")
+            .ok_or_else(|| JsValue::from_str("missing ma settings drag handle"))?;
+        let ma_settings_card = doc
+            .get_element_by_id("ma-settings-card")
+            .ok_or_else(|| JsValue::from_str("missing ma settings card"))?
+            .dyn_into::<HtmlElement>()?;
+        let connection_settings_toggle_button = doc
+            .get_element_by_id("connection-settings-toggle")
+            .ok_or_else(|| JsValue::from_str("missing connection settings toggle button"))?;
+        let connection_settings_side_toggle_button = doc
+            .get_element_by_id("connection-settings-side-toggle")
+            .ok_or_else(|| JsValue::from_str("missing connection settings side toggle button"))?;
+        let connection_settings_drag_handle = doc
+            .get_element_by_id("connection-settings-drag-handle")
+            .ok_or_else(|| JsValue::from_str("missing connection settings drag handle"))?;
+        let connection_settings_card = doc
+            .get_element_by_id("connection-settings-card")
+            .ok_or_else(|| JsValue::from_str("missing connection settings card"))?
+            .dyn_into::<HtmlElement>()?;
         let chart_canvas = doc
             .get_element_by_id("chart")
             .ok_or_else(|| JsValue::from_str("missing chart canvas"))?
@@ -1430,6 +1565,161 @@ mod web_app {
             settings_side_toggle_callback.as_ref().unchecked_ref(),
         )?;
         settings_side_toggle_callback.forget();
+
+        let ma_drag_card = ma_settings_card.clone();
+        let ma_drag_start_callback = Closure::wrap(Box::new(move |event: MouseEvent| {
+            event.prevent_default();
+            let rect = ma_drag_card.get_bounding_client_rect();
+            let offset_x = event.client_x() as f64 - rect.left();
+            let offset_y = event.client_y() as f64 - rect.top();
+            MA_SETTINGS_DRAG.with(|state| {
+                *state.borrow_mut() = Some((offset_x, offset_y));
+            });
+        }) as Box<dyn FnMut(MouseEvent)>);
+
+        ma_settings_drag_handle.add_event_listener_with_callback(
+            "mousedown",
+            ma_drag_start_callback.as_ref().unchecked_ref(),
+        )?;
+        ma_drag_start_callback.forget();
+
+        let ma_drag_move_card = ma_settings_card.clone();
+        let ma_drag_move_callback = Closure::wrap(Box::new(move |event: MouseEvent| {
+            MA_SETTINGS_DRAG.with(|state| {
+                if let Some((offset_x, offset_y)) = *state.borrow() {
+                    let card_rect = ma_drag_move_card.get_bounding_client_rect();
+                    let mut left = event.client_x() as f64 - offset_x;
+                    let mut top = event.client_y() as f64 - offset_y;
+
+                    if let Some(win) = web_sys::window() {
+                        if let (Ok(w), Ok(h)) = (win.inner_width(), win.inner_height()) {
+                            if let (Some(vw), Some(vh)) = (w.as_f64(), h.as_f64()) {
+                                left = left.clamp(0.0, (vw - card_rect.width()).max(0.0));
+                                top = top.clamp(0.0, (vh - card_rect.height()).max(0.0));
+                            }
+                        }
+                    }
+
+                    let style = ma_drag_move_card.style();
+                    let _ = style.set_property("left", &format!("{}px", left.round() as i32));
+                    let _ = style.set_property("top", &format!("{}px", top.round() as i32));
+                    let _ = style.set_property("right", "auto");
+                    let _ = style.set_property("bottom", "auto");
+                }
+            });
+        }) as Box<dyn FnMut(MouseEvent)>);
+
+        doc.add_event_listener_with_callback(
+            "mousemove",
+            ma_drag_move_callback.as_ref().unchecked_ref(),
+        )?;
+        ma_drag_move_callback.forget();
+
+        let connection_settings_toggle_callback = Closure::wrap(Box::new(move || {
+            match connection_settings_visible() {
+                Ok(visible) => {
+                    if let Err(err) = set_connection_settings_visible(!visible) {
+                        set_status(&format!("failed to toggle connection settings: {:?}", err));
+                    }
+                }
+                Err(err) => {
+                    set_status(&format!(
+                        "failed to read connection settings state: {:?}",
+                        err
+                    ));
+                }
+            }
+        }) as Box<dyn FnMut()>);
+
+        connection_settings_toggle_button.add_event_listener_with_callback(
+            "click",
+            connection_settings_toggle_callback.as_ref().unchecked_ref(),
+        )?;
+        connection_settings_toggle_callback.forget();
+
+        let connection_settings_side_toggle_callback = Closure::wrap(Box::new(move || {
+            match connection_settings_side() {
+                Ok(current) => {
+                    let next = if current == "left" { "right" } else { "left" };
+                    if let Err(err) = set_connection_settings_side(next) {
+                        set_status(&format!("failed to move connection settings card: {:?}", err));
+                    }
+                }
+                Err(err) => {
+                    set_status(&format!(
+                        "failed to read connection settings side: {:?}",
+                        err
+                    ));
+                }
+            }
+        }) as Box<dyn FnMut()>);
+
+        connection_settings_side_toggle_button.add_event_listener_with_callback(
+            "click",
+            connection_settings_side_toggle_callback.as_ref().unchecked_ref(),
+        )?;
+        connection_settings_side_toggle_callback.forget();
+
+        let drag_card = connection_settings_card.clone();
+        let drag_start_callback = Closure::wrap(Box::new(move |event: MouseEvent| {
+            event.prevent_default();
+            let rect = drag_card.get_bounding_client_rect();
+            let offset_x = event.client_x() as f64 - rect.left();
+            let offset_y = event.client_y() as f64 - rect.top();
+            CONNECTION_SETTINGS_DRAG.with(|state| {
+                *state.borrow_mut() = Some((offset_x, offset_y));
+            });
+        }) as Box<dyn FnMut(MouseEvent)>);
+
+        connection_settings_drag_handle.add_event_listener_with_callback(
+            "mousedown",
+            drag_start_callback.as_ref().unchecked_ref(),
+        )?;
+        drag_start_callback.forget();
+
+        let drag_move_card = connection_settings_card.clone();
+        let drag_move_callback = Closure::wrap(Box::new(move |event: MouseEvent| {
+            CONNECTION_SETTINGS_DRAG.with(|state| {
+                if let Some((offset_x, offset_y)) = *state.borrow() {
+                    let card_rect = drag_move_card.get_bounding_client_rect();
+                    let mut left = event.client_x() as f64 - offset_x;
+                    let mut top = event.client_y() as f64 - offset_y;
+
+                    if let Some(win) = web_sys::window() {
+                        if let (Ok(w), Ok(h)) = (win.inner_width(), win.inner_height()) {
+                            if let (Some(vw), Some(vh)) = (w.as_f64(), h.as_f64()) {
+                                left = left.clamp(0.0, (vw - card_rect.width()).max(0.0));
+                                top = top.clamp(0.0, (vh - card_rect.height()).max(0.0));
+                            }
+                        }
+                    }
+
+                    let style = drag_move_card.style();
+                    let _ = style.set_property("left", &format!("{}px", left.round() as i32));
+                    let _ = style.set_property("top", &format!("{}px", top.round() as i32));
+                    let _ = style.set_property("right", "auto");
+                    let _ = style.set_property("bottom", "auto");
+                }
+            });
+        }) as Box<dyn FnMut(MouseEvent)>);
+
+        doc.add_event_listener_with_callback(
+            "mousemove",
+            drag_move_callback.as_ref().unchecked_ref(),
+        )?;
+        drag_move_callback.forget();
+
+        let drag_end_callback = Closure::wrap(Box::new(move |_event: MouseEvent| {
+            MA_SETTINGS_DRAG.with(|state| {
+                *state.borrow_mut() = None;
+            });
+            CONNECTION_SETTINGS_DRAG.with(|state| {
+                *state.borrow_mut() = None;
+            });
+        }) as Box<dyn FnMut(MouseEvent)>);
+
+        doc.add_event_listener_with_callback("mouseup", drag_end_callback.as_ref().unchecked_ref())?;
+        drag_end_callback.forget();
 
         let move_canvas = chart_canvas.clone();
         let mouse_move_callback = Closure::wrap(Box::new(move |event: MouseEvent| {

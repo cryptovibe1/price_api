@@ -111,6 +111,79 @@
         right: auto;
       }
 
+      .connection-settings-card {
+        position: fixed;
+        top: 10px;
+        right: 10px;
+        width: min(320px, calc(100% - 28px));
+        z-index: 5;
+      }
+
+      .connection-settings-card.left {
+        left: 10px;
+        right: auto;
+      }
+
+      .connection-settings-card.collapsed {
+        width: min(280px, calc(100% - 28px));
+      }
+
+      .connection-settings-card.collapsed .settings-head {
+        padding: 8px 10px;
+      }
+
+      .connection-settings-card.collapsed .settings-title {
+        font-size: 13px;
+      }
+
+      .connection-settings-card.collapsed .settings-head-actions {
+        gap: 6px;
+      }
+
+      .connection-settings-card.collapsed .settings-side-toggle,
+      .connection-settings-card.collapsed .settings-toggle {
+        padding: 6px 10px;
+        font-size: 12px;
+      }
+
+      .connection-settings-body {
+        padding: 10px 12px 12px 12px;
+        display: grid;
+        gap: 8px;
+      }
+
+      .connection-settings-body.hidden {
+        display: none;
+      }
+
+      #connection-settings-drag-handle {
+        cursor: move;
+        user-select: none;
+      }
+
+      #ma-settings-drag-handle {
+        cursor: move;
+        user-select: none;
+      }
+
+      .connection-settings-body label {
+        display: block;
+        font-size: 12px;
+        color: var(--muted);
+        margin-bottom: 4px;
+      }
+
+      .connection-settings-body input,
+      .connection-settings-body select {
+        width: 100%;
+        box-sizing: border-box;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        padding: 10px;
+        font-size: 14px;
+        background: #fff;
+      }
+
       .ma-settings-body {
         padding: 10px 12px 12px 12px;
       }
@@ -340,6 +413,12 @@
           margin-bottom: 10px;
         }
 
+        .connection-settings-card {
+          position: static;
+          width: auto;
+          margin-bottom: 10px;
+        }
+
         .controls {
           grid-template-columns: repeat(2, minmax(120px, 1fr));
         }
@@ -359,7 +438,7 @@
     <div class="wrap">
       <div id="ma-settings-card" class="panel ma-settings-card">
         <div class="settings-head">
-          <div class="settings-title">Moving Average</div>
+          <div id="ma-settings-drag-handle" class="settings-title">Moving Average</div>
           <div class="settings-head-actions">
             <button id="settings-side-toggle" class="settings-side-toggle" type="button">Move Left</button>
             <button id="settings-toggle" class="settings-toggle" type="button">Hide Tools</button>
@@ -399,8 +478,15 @@
         </div>
       </div>
 
-      <div class="panel">
-        <div class="controls">
+      <div id="connection-settings-card" class="panel connection-settings-card left">
+        <div class="settings-head">
+          <div id="connection-settings-drag-handle" class="settings-title">Connection Settings</div>
+          <div class="settings-head-actions">
+            <button id="connection-settings-side-toggle" class="settings-side-toggle" type="button">Move Right</button>
+            <button id="connection-settings-toggle" class="settings-toggle" type="button">Hide</button>
+          </div>
+        </div>
+        <div id="connection-settings-body" class="connection-settings-body">
           <div>
             <label for="api-base">API Base</label>
             <input id="api-base" value="http://127.0.0.1:7878" />
@@ -414,6 +500,11 @@
               <option value="clickhouse">clickhouse</option>
             </select>
           </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="controls">
           <div>
             <label for="period">Period</label>
             <input id="period" value="1day" />

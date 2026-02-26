@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Price API Candles</title>
+    <style>
+      :root {
+        --bg: #eef1f7;
+        --panel: #ffffff;
+        --text: #18212f;
+        --muted: #546278;
+        --line: #d4dce8;
+        --accent: #2f7dd8;
+      }
+
+      body {
+        margin: 0;
+        font-family: "Avenir Next", "Segoe UI", sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at 10% 10%, #ffffff, transparent 45%),
+          radial-gradient(circle at 90% 0%, #dfe9ff, transparent 35%),
+          var(--bg);
+      }
+
+      .wrap {
+        position: relative;
+        max-width: 1200px;
+        margin: 20px auto;
+        padding: 0 14px;
+      }
+
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        box-shadow: 0 10px 24px rgba(33, 48, 71, 0.08);
+      }
+
+      .controls {
+        display: grid;
+        gap: 10px;
+        grid-template-columns: repeat(10, minmax(120px, 1fr));
+        padding: 14px;
+      }
+
+      .load-top {
+        grid-column: 10;
+        grid-row: 1;
+      }
+
+      .load-top #load {
+        padding: 6px 0;
+        font-size: 12px;
+        min-height: 30px;
+      }
+
+      .settings-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 12px 12px 0 12px;
+      }
+
+      .settings-head-actions {
+        display: flex;
+        gap: 8px;
+      }
+
+      .settings-title {
+        font-size: 14px;
+        font-weight: 700;
+        color: var(--text);
+      }
+
+      .settings-toggle {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fff;
+        color: var(--text);
+        font-size: 13px;
+        padding: 8px 12px;
+        cursor: pointer;
+      }
+
+      .settings-side-toggle {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fff;
+        color: var(--text);
+        font-size: 13px;
+        padding: 8px 12px;
+        cursor: pointer;
+      }
+
+      .settings-body.hidden {
+        display: none;
+      }
+
+      .ma-settings-card {
+        position: fixed;
+        top: 10px;
+        right: 10px;
+        width: min(320px, calc(100% - 28px));
+        z-index: 5;
+      }
+
+      .ma-settings-card.left {
+        left: 10px;
+        right: auto;
+      }
+
+      .ma-settings-body {
+        padding: 10px 12px 12px 12px;
+      }
+
+      .ma-list {
+        display: grid;
+        gap: 8px;
+      }
+
+      .ma-row {
+        display: grid;
+        grid-template-columns: 1fr 92px;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .ma-row .check {
+        margin-top: 0;
+      }
+
+      .ma-row .ma-period {
+        margin-top: 0;
+      }
+
+      .ma-settings-body label {
+        display: block;
+        font-size: 12px;
+        color: var(--muted);
+        margin-bottom: 4px;
+      }
+
+      .ma-settings-body input {
+        width: 100%;
+        box-sizing: border-box;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        padding: 10px;
+        font-size: 14px;
+        background: #fff;
+      }
+
+      .controls label {
+        display: block;
+        font-size: 12px;
+        color: var(--muted);
+        margin-bottom: 4px;
+      }
+
+      .controls input,
+      .controls select,
+      .controls button {
+        width: 100%;
+        box-sizing: border-box;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        padding: 10px;
+        font-size: 14px;
+        background: #fff;
+      }
+
+      .controls button {
+        margin-top: 18px;
+        background: linear-gradient(180deg, #3e8ce6, #2f7dd8);
+        color: #fff;
+        border: none;
+        font-weight: 600;
+        cursor: pointer;
+      }
+
+      .controls button.secondary {
+        background: #ffffff;
+        color: var(--text);
+        border: 1px solid var(--line);
+      }
+
+      .check {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 22px;
+        font-size: 13px;
+        color: var(--text);
+      }
+
+      .wide {
+        grid-column: span 2;
+      }
+
+      .check input {
+        width: 20px;
+        height: 20px;
+        margin: 0;
+        accent-color: var(--accent);
+      }
+
+      .toggle-btn {
+        width: 100%;
+        margin-top: 18px;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        padding: 10px;
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--text);
+        background: #ffffff;
+        cursor: pointer;
+      }
+
+      .toggle-btn.active {
+        color: #ffffff;
+        background: linear-gradient(180deg, #3e8ce6, #2f7dd8);
+        border-color: transparent;
+      }
+
+      #log-scale {
+        display: none;
+      }
+
+      .chart {
+        margin-top: 12px;
+        padding: 12px;
+        position: relative;
+      }
+
+      #status {
+        margin-top: 8px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+
+      #hover-info {
+        margin-top: 4px;
+        font-size: 13px;
+        color: #2a3650;
+      }
+
+      #hover-tooltip {
+        position: absolute;
+        display: none;
+        padding: 6px 8px;
+        border-radius: 8px;
+        font-size: 12px;
+        color: #fff;
+        background: rgba(24, 33, 47, 0.9);
+        box-shadow: 0 6px 16px rgba(0, 0, 0, 0.2);
+        pointer-events: none;
+        z-index: 6;
+        white-space: nowrap;
+      }
+
+      #cursor-vline {
+        position: absolute;
+        display: none;
+        top: 12px;
+        height: min(72vh, 640px);
+        width: 1px;
+        background: rgba(42, 54, 80, 0.55);
+        pointer-events: none;
+        z-index: 5;
+      }
+
+      #rsi-cursor-vline {
+        position: absolute;
+        display: none;
+        top: 12px;
+        width: 1px;
+        background: rgba(42, 54, 80, 0.55);
+        pointer-events: none;
+        z-index: 5;
+      }
+
+      #cursor-hline {
+        position: absolute;
+        display: none;
+        left: 0;
+        width: 100%;
+        height: 1px;
+        background: rgba(42, 54, 80, 0.5);
+        pointer-events: none;
+        z-index: 5;
+      }
+
+      #cursor-strip {
+        position: relative;
+        height: 24px;
+        margin-top: 2px;
+      }
+
+      #cursor-time-label {
+        position: absolute;
+        display: none;
+        transform: translateX(-50%);
+        top: 2px;
+        font-size: 12px;
+        color: #2a3650;
+        background: rgba(255, 255, 255, 0.92);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 2px 6px;
+        white-space: nowrap;
+        pointer-events: none;
+      }
+
+      canvas {
+        width: 100%;
+        height: min(72vh, 640px);
+        border-radius: 8px;
+      }
+
+      #rsi-chart {
+        height: min(36vh, 320px);
+      }
+
+      @media (max-width: 980px) {
+        .ma-settings-card {
+          position: static;
+          width: auto;
+          margin-bottom: 10px;
+        }
+
+        .controls {
+          grid-template-columns: repeat(2, minmax(120px, 1fr));
+        }
+
+        .wide {
+          grid-column: span 2;
+        }
+
+        .load-top {
+          grid-column: auto;
+          grid-row: auto;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div id="ma-settings-card" class="panel ma-settings-card">
+        <div class="settings-head">
+          <div class="settings-title">Moving Average</div>
+          <div class="settings-head-actions">
+            <button id="settings-side-toggle" class="settings-side-toggle" type="button">Move Left</button>
+            <button id="settings-toggle" class="settings-toggle" type="button">Hide Tools</button>
+          </div>
+        </div>
+        <div id="settings-body" class="ma-settings-body settings-body">
+          <div class="ma-list">
+            <div class="ma-row">
+              <label class="check" for="ma1-enabled"><input id="ma1-enabled" type="checkbox" checked />MA 1</label>
+              <input id="ma1-period" class="ma-period" type="number" min="2" step="1" value="13" />
+            </div>
+            <div class="ma-row">
+              <label class="check" for="ma2-enabled"><input id="ma2-enabled" type="checkbox" checked />MA 2</label>
+              <input id="ma2-period" class="ma-period" type="number" min="2" step="1" value="21" />
+            </div>
+            <div class="ma-row">
+              <label class="check" for="ma3-enabled"><input id="ma3-enabled" type="checkbox" checked />MA 3</label>
+              <input id="ma3-period" class="ma-period" type="number" min="2" step="1" value="34" />
+            </div>
+            <div class="ma-row">
+              <label class="check" for="ma4-enabled"><input id="ma4-enabled" type="checkbox" checked />MA 4</label>
+              <input id="ma4-period" class="ma-period" type="number" min="2" step="1" value="55" />
+            </div>
+            <div class="ma-row">
+              <label class="check" for="ma5-enabled"><input id="ma5-enabled" type="checkbox" />MA 5</label>
+              <input id="ma5-period" class="ma-period" type="number" min="2" step="1" value="89" />
+            </div>
+            <div class="ma-row">
+              <label class="check" for="ma6-enabled"><input id="ma6-enabled" type="checkbox" />MA 6</label>
+              <input id="ma6-period" class="ma-period" type="number" min="2" step="1" value="144" />
+            </div>
+            <div class="ma-row">
+              <label class="check" for="ma7-enabled"><input id="ma7-enabled" type="checkbox" />MA 7</label>
+              <input id="ma7-period" class="ma-period" type="number" min="2" step="1" value="233" />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="controls">
+          <div>
+            <label for="api-base">API Base</label>
+            <input id="api-base" value="http://127.0.0.1:7878" />
+          </div>
+          <div>
+            <label for="db">Database</label>
+            <select id="db">
+              <option value="postgres">postgres</option>
+              <option value="duckdb">duckdb</option>
+              <option value="timescale">timescale</option>
+              <option value="clickhouse">clickhouse</option>
+            </select>
+          </div>
+          <div>
+            <label for="period">Period</label>
+            <input id="period" value="1day" />
+          </div>
+          <div class="wide">
+            <label for="ts-start-human">ts_start</label>
+            <input id="ts-start-human" type="datetime-local" />
+          </div>
+          <div class="wide">
+            <label for="ts-end-human">ts_end</label>
+            <input id="ts-end-human" type="datetime-local" />
+          </div>
+          <div>
+            <label for="log-scale-toggle">Scale</label>
+            <input id="log-scale" type="checkbox" />
+            <button id="log-scale-toggle" class="toggle-btn" type="button">Log Off</button>
+          </div>
+          <div class="load-top">
+            <button id="load" type="button">Load</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel chart">
+        <canvas id="chart" width="1200" height="640"></canvas>
+        <div id="cursor-vline"></div>
+        <div id="cursor-hline"></div>
+        <div id="hover-tooltip"></div>
+        <div id="cursor-strip"><div id="cursor-time-label"></div></div>
+        <div id="status">Waiting for data...</div>
+        <div id="hover-info">Hover chart to see candle time</div>
+      </div>
+
+      <div class="panel chart">
+        <canvas id="rsi-chart" width="1200" height="220"></canvas>
+        <div id="rsi-cursor-vline"></div>
+      </div>
+    </div>
+
+    <link data-trunk rel="rust" />
+  </body>
+</html>

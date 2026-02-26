@@ -1,0 +1,59 @@
+volumes:
+  pgduckdb_data:
+  clickhouse_data:
+  timescaledb_data:
+  postgres_18_data:
+
+services:
+  # https://github.com/duckdb/pg_duckdb
+  pg_duckdb:
+    image: pgduckdb/pgduckdb:18-v1.1.1
+    restart: always
+    shm_size: 128mb
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${PASSWORD:-postgres1}
+    volumes:
+      - pgduckdb_data:/var/lib/postgresql
+    ports:
+      - 6132:5432
+
+  # https://github.com/ClickHouse/pg_clickhouse
+  # docker exec -it pg_clickhouse psql -U postgres -c 'CREATE EXTENSION pg_clickhouse'
+  pg_clickhouse:
+    image: ghcr.io/clickhouse/pg_clickhouse:18
+    restart: always
+    shm_size: 128mb
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${PASSWORD:-postgres1}
+    volumes:
+      - clickhouse_data:/var/lib/postgresql
+    ports:
+      - 6232:5432
+
+  # https://github.com/timescale/timescaledb
+  # docker exec -it timescaledb psql -U postgres -c 'SELECT extname, extversion FROM pg_extension'
+  timescaledb:
+    image: timescale/timescaledb:latest-pg18
+    restart: always
+    shm_size: 128mb
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${PASSWORD:-postgres1}
+    volumes:
+      - timescaledb_data:/var/lib/postgresql
+    ports:
+      - 6332:5432
+
+  postgres_18:
+    image: postgres:18
+    restart: always
+    shm_size: 128mb
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${PASSWORD:-postgres1}
+    volumes:
+      - postgres_18_data:/var/lib/postgresql
+    ports:
+      - 6432:5432

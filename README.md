@@ -10,6 +10,11 @@ curl -O https://raw.githubusercontent.com/ff137/bitstamp-btcusd-minute-data/main
 gunzip btcusd_bitstamp_1min_2012-2025.csv.gz
 ```
 
+#### Run servers
+```
+docker-compose -f docker/pg.yaml up -d
+```
+
 #### Extension
 ```
 docker exec -it docker-pg_clickhouse-1 psql -U postgres -c 'CREATE EXTENSION pg_clickhouse'

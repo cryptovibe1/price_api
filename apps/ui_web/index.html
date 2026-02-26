@@ -208,7 +208,7 @@
 
       .toggle-btn {
         width: 100%;
-        margin-top: 18px;
+        margin-top: 0;
         border: 1px solid var(--line);
         border-radius: 9px;
         padding: 10px;
@@ -217,6 +217,15 @@
         color: var(--text);
         background: #ffffff;
         cursor: pointer;
+      }
+
+      .controls #log-scale-toggle {
+        margin-top: 0;
+        white-space: nowrap;
+      }
+
+      .controls #load {
+        margin-top: 20px;
       }
 
       .toggle-btn.active {
@@ -422,7 +431,7 @@
             <input id="log-scale" type="checkbox" />
             <button id="log-scale-toggle" class="toggle-btn" type="button">Log Off</button>
           </div>
-          <div class="load-top">
+          <div>
             <button id="load" type="button">Load</button>
           </div>
         </div>

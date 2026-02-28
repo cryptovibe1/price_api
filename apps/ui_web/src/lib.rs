@@ -239,6 +239,19 @@ mod web_app {
                 None => return,
             };
 
+            let rsi_canvas_rect = rsi_canvas.get_bounding_client_rect();
+            let rsi_parent_rect = rsi_canvas
+                .parent_element()
+                .map(|el| el.get_bounding_client_rect());
+            let rsi_canvas_left = rsi_parent_rect
+                .as_ref()
+                .map(|parent| rsi_canvas_rect.left() - parent.left())
+                .unwrap_or(0.0);
+            let rsi_canvas_top = rsi_parent_rect
+                .as_ref()
+                .map(|parent| rsi_canvas_rect.top() - parent.top())
+                .unwrap_or(0.0);
+
             let main_width = main_canvas.client_width() as f64;
             let main_margin = 16.0;
             let main_y_label_area = 72.0;
@@ -268,12 +281,12 @@ mod web_app {
                             / (main_plot_right - main_plot_left))
                             .clamp(0.0, 1.0);
                     let mapped_x = plot_left + main_ratio * (plot_right - plot_left);
-                    let clamped_x = mapped_x.round() as i32;
+                    let clamped_x = (rsi_canvas_left + mapped_x).round() as i32;
                     let _ = el.style().set_property("display", "block");
                     let _ = el.style().set_property("left", &format!("{}px", clamped_x));
                     let _ = el
                         .style()
-                        .set_property("top", &format!("{}px", plot_top.round() as i32));
+                        .set_property("top", &format!("{}px", (rsi_canvas_top + plot_top).round() as i32));
                     let _ = el.style().set_property(
                         "height",
                         &format!("{}px", (plot_bottom - plot_top).max(0.0).round() as i32),
@@ -1749,6 +1762,20 @@ mod web_app {
 
                 let crosshair_x = (event.offset_x() as f64).clamp(plot_left, plot_right) as i32;
                 let crosshair_y = (event.offset_y() as f64).clamp(plot_top, plot_bottom) as i32;
+                let canvas_rect = move_canvas.get_bounding_client_rect();
+                let parent_rect = move_canvas
+                    .parent_element()
+                    .map(|el| el.get_bounding_client_rect());
+                let canvas_left = parent_rect
+                    .as_ref()
+                    .map(|parent| canvas_rect.left() - parent.left())
+                    .unwrap_or(0.0);
+                let canvas_top = parent_rect
+                    .as_ref()
+                    .map(|parent| canvas_rect.top() - parent.top())
+                    .unwrap_or(0.0);
+                let overlay_x = (canvas_left + crosshair_x as f64).round() as i32;
+                let overlay_y = (canvas_top + crosshair_y as f64).round() as i32;
 
                 let mut is_pan_mode = false;
                 PAN_LAST_X.with(|pan| {
@@ -1808,7 +1835,11 @@ mod web_app {
                         plot_bottom,
                     ) {
                         Some(v) => {
-                            show_cursor_hline(crosshair_y, plot_left, plot_right);
+                            show_cursor_hline(
+                                overlay_y,
+                                canvas_left + plot_left,
+                                canvas_left + plot_right,
+                            );
                             v
                         }
                         None => {
@@ -1821,9 +1852,13 @@ mod web_app {
                     let label_text = tooltip_text.clone();
 
                     set_hover_info(&format!("Hover time: {} | USD {:.2}", text, usd_price));
-                    show_hover_tooltip(&tooltip_text, crosshair_x, crosshair_y);
-                    show_cursor_time_label(&label_text, crosshair_x);
-                    show_cursor_vline(crosshair_x, plot_top, plot_bottom);
+                    show_hover_tooltip(&tooltip_text, overlay_x, overlay_y);
+                    show_cursor_time_label(&label_text, overlay_x);
+                    show_cursor_vline(
+                        overlay_x,
+                        canvas_top + plot_top,
+                        canvas_top + plot_bottom,
+                    );
                     show_rsi_cursor_vline(crosshair_x);
                 }
             });

@@ -107,6 +107,7 @@
       }
 
       .ma-settings-card.left {
+        top: clamp(90px, 22vh, 220px);
         left: 10px;
         right: auto;
       }
@@ -120,6 +121,7 @@
       }
 
       .connection-settings-card.left {
+        top: clamp(280px, 48vh, 460px);
         left: 10px;
         right: auto;
       }
@@ -345,8 +347,9 @@
 
       #fib-popup {
         position: fixed;
-        top: 10px;
-        right: 340px;
+        top: clamp(470px, 74vh, calc(100vh - 180px));
+        left: 10px;
+        right: auto;
         display: none;
         width: min(290px, calc(100% - 28px));
         padding: 10px;
@@ -482,7 +485,7 @@
   </head>
   <body>
     <div class="wrap">
-      <div id="ma-settings-card" class="panel ma-settings-card">
+      <div id="ma-settings-card" class="panel ma-settings-card left">
         <div class="settings-head">
           <div id="ma-settings-drag-handle" class="settings-title">Moving Average</div>
           <div class="settings-head-actions">

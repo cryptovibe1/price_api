@@ -741,7 +741,7 @@ mod web_app {
         if let Some(v) = storage.get_item(STORAGE_KEY_SETTINGS_SIDE)? {
             set_settings_side(&v)?;
         } else {
-            set_settings_side("right")?;
+            set_settings_side("left")?;
         }
         if let Some(v) = storage.get_item(STORAGE_KEY_CONNECTION_SETTINGS_VISIBLE)? {
             set_connection_settings_visible(v == "1")?;

@@ -343,6 +343,46 @@
         white-space: nowrap;
       }
 
+      #fib-popup {
+        position: fixed;
+        top: 10px;
+        right: 340px;
+        display: none;
+        width: min(290px, calc(100% - 28px));
+        padding: 10px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.95);
+        box-shadow: 0 8px 20px rgba(23, 36, 56, 0.12);
+        z-index: 6;
+      }
+
+      #fib-popup-drag-handle {
+        margin: -2px 0 8px 0;
+        font-size: 12px;
+        font-weight: 700;
+        color: var(--text);
+        cursor: move;
+        user-select: none;
+      }
+
+      #fib-popup-info {
+        margin: 0 0 8px 0;
+        font-size: 12px;
+        color: #2a3650;
+      }
+
+      #fib-popup .fib-popup-actions {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+
+      #fib-popup .toggle-btn {
+        padding: 8px;
+        font-size: 12px;
+      }
+
       #cursor-vline {
         position: absolute;
         display: none;
@@ -414,6 +454,12 @@
         }
 
         .connection-settings-card {
+          position: static;
+          width: auto;
+          margin-bottom: 10px;
+        }
+
+        #fib-popup {
           position: static;
           width: auto;
           margin-bottom: 10px;
@@ -524,6 +570,15 @@
               <option value="clickhouse">clickhouse</option>
             </select>
           </div>
+        </div>
+      </div>
+
+      <div id="fib-popup" class="panel">
+        <div id="fib-popup-drag-handle">Fibonacci Tool</div>
+        <p id="fib-popup-info">Move cursor over chart to use Fibonacci tool</p>
+        <div class="fib-popup-actions">
+          <button id="fib-toggle" class="toggle-btn" type="button">Fib Off</button>
+          <button id="fib-clear" class="toggle-btn" type="button">Clear Fib</button>
         </div>
       </div>
 

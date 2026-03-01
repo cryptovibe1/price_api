@@ -31,6 +31,9 @@ mod web_app {
         static LAST_RENDERED_CANDLES: RefCell<Vec<Candle>> = const { RefCell::new(Vec::new()) };
         static CLIENT_VIEW_RANGE: RefCell<Option<(i64, i64)>> = const { RefCell::new(None) };
         static PAN_LAST_X: RefCell<Option<i32>> = const { RefCell::new(None) };
+        static FIB_STATE: RefCell<FibState> = const { RefCell::new(FibState::new()) };
+        static FIB_PREVIEW_POINT: RefCell<Option<(i64, f64)>> = const { RefCell::new(None) };
+        static FIB_POPUP_DRAG: RefCell<Option<(f64, f64)>> = const { RefCell::new(None) };
         static MA_SETTINGS_DRAG: RefCell<Option<(f64, f64)>> = const { RefCell::new(None) };
         static CONNECTION_SETTINGS_DRAG: RefCell<Option<(f64, f64)>> = const { RefCell::new(None) };
         static CHART_VIEW: RefCell<Option<ChartView>> = const { RefCell::new(None) };
@@ -62,6 +65,23 @@ mod web_app {
         y_low: f64,
         y_high: f64,
         use_log_scale: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    struct FibState {
+        enabled: bool,
+        anchor_a: Option<(i64, f64)>,
+        anchor_b: Option<(i64, f64)>,
+    }
+
+    impl FibState {
+        const fn new() -> Self {
+            Self {
+                enabled: false,
+                anchor_a: None,
+                anchor_b: None,
+            }
+        }
     }
 
     fn document() -> Result<Document, JsValue> {
@@ -148,6 +168,78 @@ mod web_app {
         Ok(())
     }
 
+    fn sync_fib_button() -> Result<(), JsValue> {
+        let doc = document()?;
+        let button = doc
+            .get_element_by_id("fib-toggle")
+            .ok_or_else(|| JsValue::from_str("missing fib toggle button"))?;
+
+        let enabled = FIB_STATE.with(|state| state.borrow().enabled);
+        if enabled {
+            button.set_class_name("toggle-btn active");
+            button.set_text_content(Some("Fib On"));
+            button.set_attribute("aria-pressed", "true")?;
+        } else {
+            button.set_class_name("toggle-btn");
+            button.set_text_content(Some("Fib Off"));
+            button.set_attribute("aria-pressed", "false")?;
+        }
+
+        Ok(())
+    }
+
+    fn active_fib_levels() -> Option<Vec<(f64, f64)>> {
+        FIB_STATE.with(|state| {
+            let cfg = *state.borrow();
+            if !cfg.enabled {
+                return None;
+            }
+
+            let (_, price_a) = cfg.anchor_a?;
+            let (_, price_b) = match cfg.anchor_b {
+                Some(v) => v,
+                None => FIB_PREVIEW_POINT.with(|preview| *preview.borrow())?,
+            };
+            let delta = price_b - price_a;
+            let ratios = [
+                0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.681, 2.618, 3.618, 4.236,
+            ];
+            Some(ratios.into_iter().map(|r| (r, price_b - delta * r)).collect())
+        })
+    }
+
+    fn set_fib_preview_point(next: Option<(i64, f64)>) -> bool {
+        FIB_PREVIEW_POINT.with(|state| {
+            let mut cur = state.borrow_mut();
+            let changed = match (*cur, next) {
+                (None, None) => false,
+                (Some((cur_ts, cur_price)), Some((next_ts, next_price))) => {
+                    cur_ts != next_ts || (cur_price - next_price).abs() > 0.01
+                }
+                _ => true,
+            };
+            if changed {
+                *cur = next;
+            }
+            changed
+        })
+    }
+
+    fn redraw_visible_chart_only() -> Result<(), JsValue> {
+        let candles = LAST_RENDERED_CANDLES.with(|state| state.borrow().clone());
+        if candles.is_empty() {
+            return Ok(());
+        }
+        let log_scale = checkbox_checked("log-scale")?;
+        let ma_configs = moving_average_configs()?;
+        draw(&candles, log_scale, &ma_configs)
+    }
+
+    fn fib_ratio_label(ratio: f64) -> String {
+        let text = format!("{ratio:.3}");
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+
     fn set_status(text: &str) {
         if let Ok(doc) = document() {
             if let Some(node) = doc.get_element_by_id("status") {
@@ -162,6 +254,49 @@ mod web_app {
                 node.set_text_content(Some(text));
             }
         }
+    }
+
+    fn set_fib_popup_info(text: &str) {
+        if let Ok(doc) = document() {
+            if let Some(node) = doc.get_element_by_id("fib-popup-info") {
+                node.set_text_content(Some(text));
+            }
+        }
+    }
+
+    fn show_fib_popup() {
+        if let Ok(doc) = document() {
+            if let Some(node) = doc.get_element_by_id("fib-popup") {
+                if let Ok(el) = node.dyn_into::<HtmlElement>() {
+                    let _ = el.style().set_property("display", "block");
+                }
+            }
+        }
+    }
+
+    fn fib_popup_text_for_cursor(cursor_ts: i64, cursor_price: f64) -> String {
+        FIB_STATE.with(|state| {
+            let cfg = *state.borrow();
+            if !cfg.enabled {
+                return "Fib is off. Toggle Fib to start.".to_string();
+            }
+
+            match (cfg.anchor_a, cfg.anchor_b) {
+                (None, _) => format!(
+                    "Fib is on. Cursor: {} @ {:.2}. Click first point.",
+                    unix_seconds_to_hover_text(cursor_ts),
+                    cursor_price
+                ),
+                (Some((a_ts, a_price)), None) => format!(
+                    "A: {} @ {:.2}. Cursor: {} @ {:.2}. Click second point.",
+                    unix_seconds_to_hover_text(a_ts),
+                    a_price,
+                    unix_seconds_to_hover_text(cursor_ts),
+                    cursor_price
+                ),
+                (Some(_), Some(_)) => "Fib ready. Click to start new.".to_string(),
+            }
+        })
     }
 
     fn hide_hover_tooltip() {
@@ -1130,23 +1265,47 @@ mod web_app {
             return Ok(());
         }
 
-        let y_min = candles
+        let raw_y_min = candles
             .iter()
             .map(|c| c.low)
             .fold(f64::INFINITY, |acc, v| acc.min(v));
-        let y_max = candles
+        let raw_y_max = candles
             .iter()
             .map(|c| c.high)
             .fold(f64::NEG_INFINITY, |acc, v| acc.max(v));
-        let y_pad = ((y_max - y_min) * 0.06).max(1.0);
+        let fib_levels = active_fib_levels();
+
+        let mut y_min_linear = raw_y_min;
+        let mut y_max_linear = raw_y_max;
+        let mut y_min_log = raw_y_min;
+        let mut y_max_log = raw_y_max;
+
+        if let Some(levels) = &fib_levels {
+            for (_, level_price) in levels {
+                if !level_price.is_finite() {
+                    continue;
+                }
+                y_min_linear = y_min_linear.min(*level_price);
+                y_max_linear = y_max_linear.max(*level_price);
+                if *level_price > 0.0 {
+                    y_min_log = y_min_log.min(*level_price);
+                    y_max_log = y_max_log.max(*level_price);
+                }
+            }
+        }
+
+        let y_span_linear = (y_max_linear - y_min_linear).abs();
+        let y_pad_linear = (y_span_linear * 0.06).max(1.0);
+        let y_span_log = (y_max_log - y_min_log).abs();
+        let y_pad_log = (y_span_log * 0.06).max(1.0);
 
         let x_max = candles.len() as i32;
-        let use_log_scale = log_scale && y_min > 0.0;
+        let use_log_scale = log_scale && y_min_log > 0.0;
         let x_timestamps: Vec<i64> = candles.iter().map(|c| c.timestamp).collect();
         let (y_low, y_high) = if use_log_scale {
-            (y_min, y_max + y_pad)
+            (y_min_log, y_max_log + y_pad_log)
         } else {
-            (y_min - y_pad, y_max + y_pad)
+            (y_min_linear - y_pad_linear, y_max_linear + y_pad_linear)
         };
         CHART_VIEW.with(|view| {
             *view.borrow_mut() = Some(ChartView {
@@ -1161,13 +1320,14 @@ mod web_app {
             .map(|cfg| (cfg.color, sma_points(candles, cfg.period)))
             .filter(|(_, points)| !points.is_empty())
             .collect();
+        let fib_x_right = x_max.saturating_sub(1);
 
         if use_log_scale {
             let mut chart = ChartBuilder::on(&root)
                 .margin(16)
                 .x_label_area_size(36)
                 .y_label_area_size(72)
-                .build_cartesian_2d(0..x_max, (y_min..(y_max + y_pad)).log_scale())
+                .build_cartesian_2d(0..x_max, (y_min_log..(y_max_log + y_pad_log)).log_scale())
                 .map_err(|e| JsValue::from_str(&format!("chart build error: {e}")))?;
 
             chart
@@ -1202,12 +1362,38 @@ mod web_app {
                     .draw_series(LineSeries::new(points.clone(), color))
                     .map_err(|e| JsValue::from_str(&format!("ma draw error: {e}")))?;
             }
+
+            if let Some(levels) = &fib_levels {
+                for (ratio, level_price) in levels {
+                    if *level_price <= 0.0 {
+                        continue;
+                    }
+                    chart
+                        .draw_series(LineSeries::new(
+                            vec![(0, *level_price), (fib_x_right, *level_price)],
+                            &RGBColor(173, 104, 32),
+                        ))
+                        .map_err(|e| JsValue::from_str(&format!("fib draw error: {e}")))?;
+                    chart
+                        .draw_series(std::iter::once(Text::new(
+                            format!(
+                                "{} ({:.1}%)  {:.2}",
+                                fib_ratio_label(*ratio),
+                                ratio * 100.0,
+                                level_price
+                            ),
+                            (2, *level_price),
+                            ("sans-serif", 11).into_font().color(&RGBColor(122, 72, 24)),
+                        )))
+                        .map_err(|e| JsValue::from_str(&format!("fib label draw error: {e}")))?;
+                }
+            }
         } else {
             let mut chart = ChartBuilder::on(&root)
                 .margin(16)
                 .x_label_area_size(36)
                 .y_label_area_size(72)
-                .build_cartesian_2d(0..x_max, (y_min - y_pad)..(y_max + y_pad))
+                .build_cartesian_2d(0..x_max, (y_min_linear - y_pad_linear)..(y_max_linear + y_pad_linear))
                 .map_err(|e| JsValue::from_str(&format!("chart build error: {e}")))?;
 
             chart
@@ -1241,6 +1427,29 @@ mod web_app {
                 chart
                     .draw_series(LineSeries::new(points.clone(), color))
                     .map_err(|e| JsValue::from_str(&format!("ma draw error: {e}")))?;
+            }
+
+            if let Some(levels) = &fib_levels {
+                for (ratio, level_price) in levels {
+                    chart
+                        .draw_series(LineSeries::new(
+                            vec![(0, *level_price), (fib_x_right, *level_price)],
+                            &RGBColor(173, 104, 32),
+                        ))
+                        .map_err(|e| JsValue::from_str(&format!("fib draw error: {e}")))?;
+                    chart
+                        .draw_series(std::iter::once(Text::new(
+                            format!(
+                                "{} ({:.1}%)  {:.2}",
+                                fib_ratio_label(*ratio),
+                                ratio * 100.0,
+                                level_price
+                            ),
+                            (2, *level_price),
+                            ("sans-serif", 11).into_font().color(&RGBColor(122, 72, 24)),
+                        )))
+                        .map_err(|e| JsValue::from_str(&format!("fib label draw error: {e}")))?;
+                }
             }
         }
 
@@ -1373,6 +1582,8 @@ mod web_app {
 
     fn setup_defaults() -> Result<(), JsValue> {
         load_saved_inputs()?;
+        sync_fib_button()?;
+        set_fib_popup_info("Move cursor over chart to use Fibonacci tool");
 
         let now_secs = (Date::now() / 1000.0) as i64;
         let back_30_days = now_secs - 30 * 24 * 60 * 60;
@@ -1395,6 +1606,19 @@ mod web_app {
         let log_scale_toggle_button = doc
             .get_element_by_id("log-scale-toggle")
             .ok_or_else(|| JsValue::from_str("missing log scale toggle button"))?;
+        let fib_toggle_button = doc
+            .get_element_by_id("fib-toggle")
+            .ok_or_else(|| JsValue::from_str("missing fib toggle button"))?;
+        let fib_clear_button = doc
+            .get_element_by_id("fib-clear")
+            .ok_or_else(|| JsValue::from_str("missing fib clear button"))?;
+        let fib_popup = doc
+            .get_element_by_id("fib-popup")
+            .ok_or_else(|| JsValue::from_str("missing fib popup"))?
+            .dyn_into::<HtmlElement>()?;
+        let fib_popup_drag_handle = doc
+            .get_element_by_id("fib-popup-drag-handle")
+            .ok_or_else(|| JsValue::from_str("missing fib popup drag handle"))?;
         let settings_toggle_button = doc
             .get_element_by_id("settings-toggle")
             .ok_or_else(|| JsValue::from_str("missing settings toggle button"))?;
@@ -1508,6 +1732,109 @@ mod web_app {
             log_scale_callback.as_ref().unchecked_ref(),
         )?;
         log_scale_callback.forget();
+
+        let fib_toggle_callback = Closure::wrap(Box::new(move || {
+            FIB_STATE.with(|state| {
+                let mut cfg = state.borrow_mut();
+                cfg.enabled = !cfg.enabled;
+                cfg.anchor_a = None;
+                cfg.anchor_b = None;
+            });
+            let _ = set_fib_preview_point(None);
+            if let Err(err) = sync_fib_button() {
+                set_status(&format!("failed: {:?}", err));
+                return;
+            }
+            let fib_enabled = FIB_STATE.with(|state| state.borrow().enabled);
+            if fib_enabled {
+                set_status("Fib tool: click first point, then second point");
+                set_fib_popup_info("Fib is on. Click first point on chart.");
+            } else {
+                set_status("Fib tool disabled");
+                set_fib_popup_info("Fib is off. Toggle Fib to start.");
+            }
+            spawn_local(async {
+                if let Err(err) = rerender_cached_or_fetch().await {
+                    set_status(&format!("failed: {:?}", err));
+                }
+            });
+        }) as Box<dyn FnMut()>);
+
+        fib_toggle_button.add_event_listener_with_callback(
+            "click",
+            fib_toggle_callback.as_ref().unchecked_ref(),
+        )?;
+        fib_toggle_callback.forget();
+
+        let fib_clear_callback = Closure::wrap(Box::new(move || {
+            FIB_STATE.with(|state| {
+                let mut cfg = state.borrow_mut();
+                cfg.anchor_a = None;
+                cfg.anchor_b = None;
+            });
+            let _ = set_fib_preview_point(None);
+            set_status("Fib levels cleared");
+            set_fib_popup_info("Fib anchors cleared. Click first point.");
+            spawn_local(async {
+                if let Err(err) = rerender_cached_or_fetch().await {
+                    set_status(&format!("failed: {:?}", err));
+                }
+            });
+        }) as Box<dyn FnMut()>);
+
+        fib_clear_button.add_event_listener_with_callback(
+            "click",
+            fib_clear_callback.as_ref().unchecked_ref(),
+        )?;
+        fib_clear_callback.forget();
+
+        let fib_drag_popup = fib_popup.clone();
+        let fib_drag_start_callback = Closure::wrap(Box::new(move |event: MouseEvent| {
+            event.prevent_default();
+            let rect = fib_drag_popup.get_bounding_client_rect();
+            let offset_x = event.client_x() as f64 - rect.left();
+            let offset_y = event.client_y() as f64 - rect.top();
+            FIB_POPUP_DRAG.with(|state| {
+                *state.borrow_mut() = Some((offset_x, offset_y));
+            });
+        }) as Box<dyn FnMut(MouseEvent)>);
+
+        fib_popup_drag_handle.add_event_listener_with_callback(
+            "mousedown",
+            fib_drag_start_callback.as_ref().unchecked_ref(),
+        )?;
+        fib_drag_start_callback.forget();
+
+        let fib_drag_move_popup = fib_popup.clone();
+        let fib_drag_move_callback = Closure::wrap(Box::new(move |event: MouseEvent| {
+            FIB_POPUP_DRAG.with(|state| {
+                if let Some((offset_x, offset_y)) = *state.borrow() {
+                    let popup_rect = fib_drag_move_popup.get_bounding_client_rect();
+                    let mut left = event.client_x() as f64 - offset_x;
+                    let mut top = event.client_y() as f64 - offset_y;
+
+                    if let Some(win) = web_sys::window() {
+                        if let (Ok(w), Ok(h)) = (win.inner_width(), win.inner_height()) {
+                            if let (Some(vw), Some(vh)) = (w.as_f64(), h.as_f64()) {
+                                left = left.clamp(0.0, (vw - popup_rect.width()).max(0.0));
+                                top = top.clamp(0.0, (vh - popup_rect.height()).max(0.0));
+                            }
+                        }
+                    }
+
+                    let style = fib_drag_move_popup.style();
+                    let _ = style.set_property("left", &format!("{}px", left.round() as i32));
+                    let _ = style.set_property("top", &format!("{}px", top.round() as i32));
+                    let _ = style.set_property("right", "auto");
+                }
+            });
+        }) as Box<dyn FnMut(MouseEvent)>);
+
+        doc.add_event_listener_with_callback(
+            "mousemove",
+            fib_drag_move_callback.as_ref().unchecked_ref(),
+        )?;
+        fib_drag_move_callback.forget();
 
         for idx in 1..=MA_COUNT {
             let ma_enabled = doc
@@ -1735,6 +2062,9 @@ mod web_app {
             CONNECTION_SETTINGS_DRAG.with(|state| {
                 *state.borrow_mut() = None;
             });
+            FIB_POPUP_DRAG.with(|state| {
+                *state.borrow_mut() = None;
+            });
         }) as Box<dyn FnMut(MouseEvent)>);
 
         doc.add_event_listener_with_callback("mouseup", drag_end_callback.as_ref().unchecked_ref())?;
@@ -1742,10 +2072,16 @@ mod web_app {
 
         let move_canvas = chart_canvas.clone();
         let mouse_move_callback = Closure::wrap(Box::new(move |event: MouseEvent| {
+            show_fib_popup();
+            let mut need_fib_redraw = false;
             LAST_RENDERED_CANDLES.with(|state| {
                 let candles = state.borrow();
                 if candles.is_empty() {
+                    if set_fib_preview_point(None) {
+                        need_fib_redraw = true;
+                    }
                     set_hover_info("Hover chart to see candle time");
+                    set_fib_popup_info("Load candles, then move cursor and click points for Fib.");
                     hide_hover_tooltip();
                     hide_cursor_time_label();
                     hide_cursor_vline();
@@ -1807,6 +2143,10 @@ mod web_app {
                 });
 
                 if is_pan_mode {
+                    if set_fib_preview_point(None) {
+                        need_fib_redraw = true;
+                    }
+                    set_fib_popup_info("Pan mode active. Release Shift to place Fib points.");
                     hide_hover_tooltip();
                     hide_cursor_time_label();
                     hide_cursor_vline();
@@ -1823,7 +2163,11 @@ mod web_app {
                 ) {
                     Some(idx) => idx,
                     None => {
+                        if set_fib_preview_point(None) {
+                            need_fib_redraw = true;
+                        }
                         set_hover_info("Hover chart to see candle time");
+                        set_fib_popup_info("Move cursor inside chart plot area.");
                         hide_hover_tooltip();
                         hide_cursor_time_label();
                         hide_cursor_vline();
@@ -1856,8 +2200,21 @@ mod web_app {
 
                     let tooltip_text = format!("{} | USD {:.2}", text, usd_price);
                     let label_text = tooltip_text.clone();
+                    let fib_text = fib_popup_text_for_cursor(candle.timestamp, usd_price);
+                    let fib_preview = FIB_STATE.with(|fib| {
+                        let cfg = *fib.borrow();
+                        if cfg.enabled && cfg.anchor_a.is_some() && cfg.anchor_b.is_none() {
+                            Some((candle.timestamp, usd_price))
+                        } else {
+                            None
+                        }
+                    });
+                    if set_fib_preview_point(fib_preview) {
+                        need_fib_redraw = true;
+                    }
 
                     set_hover_info(&format!("Hover time: {} | USD {:.2}", text, usd_price));
+                    set_fib_popup_info(&fib_text);
                     show_hover_tooltip(&tooltip_text, overlay_x, overlay_y);
                     show_cursor_time_label(&label_text, overlay_x);
                     show_cursor_vline(
@@ -1868,6 +2225,11 @@ mod web_app {
                     show_rsi_cursor_vline(crosshair_x);
                 }
             });
+            if need_fib_redraw {
+                if let Err(err) = redraw_visible_chart_only() {
+                    set_status(&format!("failed: {:?}", err));
+                }
+            }
         }) as Box<dyn FnMut(MouseEvent)>);
 
         chart_canvas.add_event_listener_with_callback(
@@ -1876,10 +2238,72 @@ mod web_app {
         )?;
         mouse_move_callback.forget();
 
+        let fib_canvas = chart_canvas.clone();
         let mouse_down_callback = Closure::wrap(Box::new(move |event: MouseEvent| {
             LAST_RENDERED_CANDLES.with(|state| {
                 let candles = state.borrow();
                 if candles.is_empty() {
+                    return;
+                }
+
+                if FIB_STATE.with(|fib| fib.borrow().enabled) && !event.shift_key() {
+                    let _ = set_fib_preview_point(None);
+                    let canvas_width = fib_canvas.client_width() as f64;
+                    let canvas_height = fib_canvas.client_height() as f64;
+                    let (plot_left, plot_right, plot_top, plot_bottom) =
+                        match plot_bounds(canvas_width, canvas_height) {
+                            Some(v) => v,
+                            None => return,
+                        };
+
+                    let crosshair_x = (event.offset_x() as f64).clamp(plot_left, plot_right);
+                    let crosshair_y = (event.offset_y() as f64).clamp(plot_top, plot_bottom);
+                    let idx = match candle_index_from_canvas_x(
+                        candles.len(),
+                        canvas_width,
+                        canvas_height,
+                        crosshair_x,
+                    ) {
+                        Some(v) => v,
+                        None => return,
+                    };
+                    let candle = match candles.get(idx) {
+                        Some(v) => v,
+                        None => return,
+                    };
+                    let price = price_from_canvas_y(crosshair_y, plot_top, plot_bottom)
+                        .unwrap_or(candle.close);
+
+                    let status_message = FIB_STATE.with(|fib| {
+                        let mut cfg = fib.borrow_mut();
+                        if cfg.anchor_a.is_none() || cfg.anchor_b.is_some() {
+                            cfg.anchor_a = Some((candle.timestamp, price));
+                            cfg.anchor_b = None;
+                            format!(
+                                "Fib first point set: {} @ {:.2}. Click second point",
+                                unix_seconds_to_hover_text(candle.timestamp),
+                                price
+                            )
+                        } else {
+                            cfg.anchor_b = Some((candle.timestamp, price));
+                            let (anchor_ts, anchor_price) = cfg.anchor_a.unwrap();
+                            format!(
+                                "Fib ready: {} @ {:.2} -> {} @ {:.2}",
+                                unix_seconds_to_hover_text(anchor_ts),
+                                anchor_price,
+                                unix_seconds_to_hover_text(candle.timestamp),
+                                price
+                            )
+                        }
+                    });
+
+                    set_status(&status_message);
+                    set_fib_popup_info(&status_message);
+                    spawn_local(async {
+                        if let Err(err) = rerender_cached_or_fetch().await {
+                            set_status(&format!("failed: {:?}", err));
+                        }
+                    });
                     return;
                 }
 
@@ -1917,6 +2341,7 @@ mod web_app {
         mouse_up_callback.forget();
 
         let mouse_leave_callback = Closure::wrap(Box::new(move || {
+            let clear_preview = set_fib_preview_point(None);
             PAN_LAST_X.with(|pan| {
                 *pan.borrow_mut() = None;
             });
@@ -1927,6 +2352,11 @@ mod web_app {
             hide_cursor_vline();
             hide_cursor_hline();
             hide_rsi_cursor_vline();
+            if clear_preview {
+                if let Err(err) = redraw_visible_chart_only() {
+                    set_status(&format!("failed: {:?}", err));
+                }
+            }
         }) as Box<dyn FnMut()>);
 
         chart_canvas.add_event_listener_with_callback(

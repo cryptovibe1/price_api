@@ -1,5 +1,6 @@
 #### Bench marks for db
 
+## BTC
 ### Data sources
 ```
 https://ff137.github.io/bitstamp-btcusd-minute-data/
@@ -73,4 +74,16 @@ curl -O https://raw.githubusercontent.com/ff137/bitstamp-btcusd-minute-data/main
 docker exec docker-pg_duckdb-1 psql -U postgres -c "SELECT max(timestamp) from btc_usd"
 sed '1,/^1771981140/d' btcusd_bitstamp_1min_latest.csv > btcusd_bitstamp_1min_latest_patch.csv
 docker exec -i docker-pg_duckdb-1 psql -U postgres -c "COPY btc_usd FROM STDIN WITH (FORMAT CSV, HEADER)" < btcusd_bitstamp_1min_latest_patch.csv
+```
+### Via bash script
+```
+./append_btcusd_latest.sh
+```
+
+
+# Etherium
+### Data sources
+```
+https://www.kaggle.com/datasets/imranbukhari/comprehensive-ethusd-1m-data?resource=download
+https://www.kaggle.com/datasets/imranbukhari/comprehensive-ethusd-1m-data?resource=download&select=ETHUSD_1m_Bitfinex.csv
 ```

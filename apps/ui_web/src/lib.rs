@@ -240,6 +240,29 @@ mod web_app {
         text.trim_end_matches('0').trim_end_matches('.').to_string()
     }
 
+    fn visible_fib_levels(
+        fib_levels: &Option<Vec<(f64, f64)>>,
+        y_low: f64,
+        y_high: f64,
+        log_scale: bool,
+    ) -> Vec<(f64, f64)> {
+        fib_levels
+            .as_ref()
+            .map(|levels| {
+                levels
+                    .iter()
+                    .copied()
+                    .filter(|(_, level_price)| {
+                        level_price.is_finite()
+                            && (!log_scale || *level_price > 0.0)
+                            && *level_price >= y_low
+                            && *level_price <= y_high
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn set_status(text: &str) {
         if let Ok(doc) = document() {
             if let Some(node) = doc.get_element_by_id("status") {
@@ -262,6 +285,15 @@ mod web_app {
                 node.set_text_content(Some(text));
             }
         }
+    }
+
+    fn clear_fib_levels() {
+        FIB_STATE.with(|state| {
+            let mut cfg = state.borrow_mut();
+            cfg.anchor_a = None;
+            cfg.anchor_b = None;
+        });
+        let _ = set_fib_preview_point(None);
     }
 
     fn show_fib_popup() {
@@ -1275,24 +1307,11 @@ mod web_app {
             .fold(f64::NEG_INFINITY, |acc, v| acc.max(v));
         let fib_levels = active_fib_levels();
 
-        let mut y_min_linear = raw_y_min;
-        let mut y_max_linear = raw_y_max;
-        let mut y_min_log = raw_y_min;
-        let mut y_max_log = raw_y_max;
-
-        if let Some(levels) = &fib_levels {
-            for (_, level_price) in levels {
-                if !level_price.is_finite() {
-                    continue;
-                }
-                y_min_linear = y_min_linear.min(*level_price);
-                y_max_linear = y_max_linear.max(*level_price);
-                if *level_price > 0.0 {
-                    y_min_log = y_min_log.min(*level_price);
-                    y_max_log = y_max_log.max(*level_price);
-                }
-            }
-        }
+        // Keep autoscaling tied to market data so Fib extensions don't flatten the chart.
+        let y_min_linear = raw_y_min;
+        let y_max_linear = raw_y_max;
+        let y_min_log = raw_y_min;
+        let y_max_log = raw_y_max;
 
         let y_span_linear = (y_max_linear - y_min_linear).abs();
         let y_pad_linear = (y_span_linear * 0.06).max(1.0);
@@ -1321,6 +1340,7 @@ mod web_app {
             .filter(|(_, points)| !points.is_empty())
             .collect();
         let fib_x_right = x_max.saturating_sub(1);
+        let visible_fib_levels = visible_fib_levels(&fib_levels, y_low, y_high, use_log_scale);
 
         if use_log_scale {
             let mut chart = ChartBuilder::on(&root)
@@ -1363,30 +1383,25 @@ mod web_app {
                     .map_err(|e| JsValue::from_str(&format!("ma draw error: {e}")))?;
             }
 
-            if let Some(levels) = &fib_levels {
-                for (ratio, level_price) in levels {
-                    if *level_price <= 0.0 {
-                        continue;
-                    }
-                    chart
-                        .draw_series(LineSeries::new(
+            for (ratio, level_price) in &visible_fib_levels {
+                chart
+                    .draw_series(LineSeries::new(
                             vec![(0, *level_price), (fib_x_right, *level_price)],
                             &RGBColor(173, 104, 32),
                         ))
-                        .map_err(|e| JsValue::from_str(&format!("fib draw error: {e}")))?;
-                    chart
-                        .draw_series(std::iter::once(Text::new(
-                            format!(
-                                "{} ({:.1}%)  {:.2}",
-                                fib_ratio_label(*ratio),
-                                ratio * 100.0,
-                                level_price
-                            ),
-                            (2, *level_price),
-                            ("sans-serif", 11).into_font().color(&RGBColor(122, 72, 24)),
-                        )))
-                        .map_err(|e| JsValue::from_str(&format!("fib label draw error: {e}")))?;
-                }
+                    .map_err(|e| JsValue::from_str(&format!("fib draw error: {e}")))?;
+                chart
+                    .draw_series(std::iter::once(Text::new(
+                        format!(
+                            "{} ({:.1}%)  {:.2}",
+                            fib_ratio_label(*ratio),
+                            ratio * 100.0,
+                            level_price
+                        ),
+                        (2, *level_price),
+                        ("sans-serif", 11).into_font().color(&RGBColor(122, 72, 24)),
+                    )))
+                    .map_err(|e| JsValue::from_str(&format!("fib label draw error: {e}")))?;
             }
         } else {
             let mut chart = ChartBuilder::on(&root)
@@ -1429,27 +1444,25 @@ mod web_app {
                     .map_err(|e| JsValue::from_str(&format!("ma draw error: {e}")))?;
             }
 
-            if let Some(levels) = &fib_levels {
-                for (ratio, level_price) in levels {
-                    chart
-                        .draw_series(LineSeries::new(
+            for (ratio, level_price) in &visible_fib_levels {
+                chart
+                    .draw_series(LineSeries::new(
                             vec![(0, *level_price), (fib_x_right, *level_price)],
                             &RGBColor(173, 104, 32),
                         ))
-                        .map_err(|e| JsValue::from_str(&format!("fib draw error: {e}")))?;
-                    chart
-                        .draw_series(std::iter::once(Text::new(
-                            format!(
-                                "{} ({:.1}%)  {:.2}",
-                                fib_ratio_label(*ratio),
-                                ratio * 100.0,
-                                level_price
-                            ),
-                            (2, *level_price),
-                            ("sans-serif", 11).into_font().color(&RGBColor(122, 72, 24)),
-                        )))
-                        .map_err(|e| JsValue::from_str(&format!("fib label draw error: {e}")))?;
-                }
+                    .map_err(|e| JsValue::from_str(&format!("fib draw error: {e}")))?;
+                chart
+                    .draw_series(std::iter::once(Text::new(
+                        format!(
+                            "{} ({:.1}%)  {:.2}",
+                            fib_ratio_label(*ratio),
+                            ratio * 100.0,
+                            level_price
+                        ),
+                        (2, *level_price),
+                        ("sans-serif", 11).into_font().color(&RGBColor(122, 72, 24)),
+                    )))
+                    .map_err(|e| JsValue::from_str(&format!("fib label draw error: {e}")))?;
             }
         }
 
@@ -1666,6 +1679,19 @@ mod web_app {
             if (event.ctrl_key() || event.meta_key()) && event.key().eq_ignore_ascii_case("z") {
                 event.prevent_default();
                 undo_last_range_change();
+                return;
+            }
+
+            if event.key() == "Escape" {
+                event.prevent_default();
+                clear_fib_levels();
+                set_status("Fib levels cleared");
+                set_fib_popup_info("Fib anchors cleared. Click first point.");
+                spawn_local(async {
+                    if let Err(err) = rerender_cached_or_fetch().await {
+                        set_status(&format!("failed: {:?}", err));
+                    }
+                });
             }
         }) as Box<dyn FnMut(KeyboardEvent)>);
 
@@ -1767,12 +1793,7 @@ mod web_app {
         fib_toggle_callback.forget();
 
         let fib_clear_callback = Closure::wrap(Box::new(move || {
-            FIB_STATE.with(|state| {
-                let mut cfg = state.borrow_mut();
-                cfg.anchor_a = None;
-                cfg.anchor_b = None;
-            });
-            let _ = set_fib_preview_point(None);
+            clear_fib_levels();
             set_status("Fib levels cleared");
             set_fib_popup_info("Fib anchors cleared. Click first point.");
             spawn_local(async {

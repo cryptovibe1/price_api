@@ -62,6 +62,8 @@ mod web_app {
 
     #[derive(Clone, Copy)]
     struct ChartView {
+        x_start: i64,
+        x_end: i64,
         y_low: f64,
         y_high: f64,
         use_log_scale: bool,
@@ -904,7 +906,7 @@ mod web_app {
         Ok(configs)
     }
 
-    fn sma_points(candles: &[Candle], window: usize) -> Vec<(i32, f64)> {
+    fn sma_points(candles: &[Candle], window: usize) -> Vec<(i64, f64)> {
         if candles.len() < window {
             return Vec::new();
         }
@@ -918,14 +920,14 @@ mod web_app {
                 rolling_sum -= candles[idx - window].close;
             }
             if idx + 1 >= window {
-                points.push((idx as i32, rolling_sum / window as f64));
+                points.push((candle.timestamp, rolling_sum / window as f64));
             }
         }
 
         points
     }
 
-    fn rsi_points(candles: &[Candle], period: usize) -> Vec<(i32, f64)> {
+    fn rsi_points(candles: &[Candle], period: usize) -> Vec<(i64, f64)> {
         if candles.len() <= period {
             return Vec::new();
         }
@@ -951,7 +953,7 @@ mod web_app {
             let rs = avg_gain / avg_loss;
             100.0 - (100.0 / (1.0 + rs))
         };
-        points.push((period as i32, first_rsi));
+        points.push((candles[period].timestamp, first_rsi));
 
         for i in (period + 1)..candles.len() {
             let diff = candles[i].close - candles[i - 1].close;
@@ -968,7 +970,7 @@ mod web_app {
                 100.0 - (100.0 / (1.0 + rs))
             };
 
-            points.push((i as i32, rsi));
+            points.push((candles[i].timestamp, rsi));
         }
 
         points
@@ -987,19 +989,28 @@ mod web_app {
         root.fill(&RGBColor(246, 247, 251))
             .map_err(|e| JsValue::from_str(&format!("rsi background error: {e}")))?;
 
-        if candles.is_empty() {
+        let (x_start, x_end) = rendered_range()
+            .or_else(|| {
+                candles.first().zip(candles.last()).map(|(first, last)| {
+                    let start = first.timestamp.min(last.timestamp);
+                    let end = first.timestamp.max(last.timestamp);
+                    (start, (start + 60).max(end))
+                })
+            })
+            .unwrap_or((0, 60));
+
+        if candles.is_empty() && LAST_CANDLES.with(|state| state.borrow().is_empty()) {
             root.present()
                 .map_err(|e| JsValue::from_str(&format!("rsi present error: {e}")))?;
             return Ok(());
         }
 
-        let x_max = candles.len() as i32;
         let mut chart = ChartBuilder::on(&root)
             .margin(10)
             .x_label_area_size(22)
             .y_label_area_size(44)
             .caption("RSI (14)", ("sans-serif", 16).into_font())
-            .build_cartesian_2d(0..x_max, 0.0f64..100.0f64)
+            .build_cartesian_2d(x_start..x_end, 0.0f64..100.0f64)
             .map_err(|e| JsValue::from_str(&format!("rsi chart build error: {e}")))?;
 
         chart
@@ -1007,6 +1018,7 @@ mod web_app {
             .x_labels(8)
             .y_labels(5)
             .disable_x_mesh()
+            .x_label_formatter(&|x| unix_seconds_to_date_text(*x))
             .draw()
             .map_err(|e| JsValue::from_str(&format!("rsi mesh draw error: {e}")))?;
 
@@ -1018,10 +1030,16 @@ mod web_app {
         }
 
         chart
-            .draw_series(LineSeries::new(vec![(0, 70.0), (x_max, 70.0)], &RGBColor(176, 78, 66)))
+            .draw_series(LineSeries::new(
+                vec![(x_start, 70.0), (x_end, 70.0)],
+                &RGBColor(176, 78, 66),
+            ))
             .map_err(|e| JsValue::from_str(&format!("rsi 70 draw error: {e}")))?;
         chart
-            .draw_series(LineSeries::new(vec![(0, 30.0), (x_max, 30.0)], &RGBColor(59, 138, 101)))
+            .draw_series(LineSeries::new(
+                vec![(x_start, 30.0), (x_end, 30.0)],
+                &RGBColor(59, 138, 101),
+            ))
             .map_err(|e| JsValue::from_str(&format!("rsi 30 draw error: {e}")))?;
 
         root.present()
@@ -1102,26 +1120,36 @@ mod web_app {
         })
     }
 
+    fn candle_bounds(candles: &[Candle]) -> Option<(i64, i64)> {
+        let first = candles.first()?.timestamp;
+        let last = candles.last()?.timestamp;
+        Some((first.min(last), first.max(last)))
+    }
+
+    fn loaded_candle_spacing() -> i64 {
+        LAST_CANDLES.with(|state| inferred_candle_spacing(&state.borrow()))
+    }
+
     fn clamp_range_to_loaded(ts_start: i64, ts_end: i64) -> (i64, i64) {
         let (mut start, mut end) = if ts_start <= ts_end {
             (ts_start, ts_end)
         } else {
             (ts_end, ts_start)
         };
+        let mut span = (end - start).max(60);
 
-        if let Some((min_ts, max_ts)) = loaded_bounds() {
-            let span = (end - start).max(60);
-            if start < min_ts {
-                start = min_ts;
-                end = (start + span).min(max_ts);
-            }
-            if end > max_ts {
-                end = max_ts;
-                start = (end - span).max(min_ts);
-            }
-            if end <= start {
-                end = (start + 60).min(max_ts);
-            }
+        if let Some((min_ts, _max_ts)) = loaded_bounds() {
+            let max_future_ts = (Date::now() / 1000.0) as i64 + loaded_candle_spacing() * 300;
+            let available_span = (max_future_ts - min_ts).max(60);
+            span = span.min(available_span);
+            start = start.clamp(min_ts, max_future_ts - span);
+            end = start + span;
+        } else {
+            end = start + span;
+        }
+
+        if end <= start {
+            end = start + 60;
         }
 
         (start, end)
@@ -1221,13 +1249,12 @@ mod web_app {
         Some((plot_left, plot_right, plot_top, plot_bottom))
     }
 
-    fn candle_index_from_canvas_x(
-        candles_len: usize,
+    fn timestamp_from_canvas_x(
         canvas_width: f64,
         canvas_height: f64,
         offset_x: f64,
-    ) -> Option<usize> {
-        if candles_len == 0 || canvas_width <= 0.0 {
+    ) -> Option<i64> {
+        if canvas_width <= 0.0 {
             return None;
         }
 
@@ -1238,7 +1265,11 @@ mod web_app {
 
         let clamped_x = offset_x.clamp(plot_left, plot_right);
         let ratio = ((clamped_x - plot_left) / (plot_right - plot_left)).clamp(0.0, 1.0);
-        Some((ratio * (candles_len.saturating_sub(1) as f64)).round() as usize)
+        CHART_VIEW.with(|view| {
+            let cfg = (*view.borrow())?;
+            let span = (cfg.x_end - cfg.x_start).max(60) as f64;
+            Some((cfg.x_start as f64 + ratio * span).round() as i64)
+        })
     }
 
     fn price_from_canvas_y(offset_y: f64, plot_top: f64, plot_bottom: f64) -> Option<f64> {
@@ -1264,6 +1295,29 @@ mod web_app {
         })
     }
 
+    fn inferred_candle_spacing(candles: &[Candle]) -> i64 {
+        candles
+            .windows(2)
+            .map(|pair| (pair[1].timestamp - pair[0].timestamp).abs())
+            .find(|diff| *diff > 0)
+            .unwrap_or(60)
+            .max(60)
+    }
+
+    fn nearest_candle_for_timestamp(candles: &[Candle], ts: i64) -> Option<&Candle> {
+        let spacing = inferred_candle_spacing(candles);
+        candles
+            .iter()
+            .min_by_key(|candle| (candle.timestamp - ts).abs())
+            .and_then(|candle| {
+                if (candle.timestamp - ts).abs() <= spacing / 2 {
+                    Some(candle)
+                } else {
+                    None
+                }
+            })
+    }
+
     fn draw(
         candles: &[Candle],
         log_scale: bool,
@@ -1280,13 +1334,51 @@ mod web_app {
         let root = backend.into_drawing_area();
         root.fill(&RGBColor(246, 247, 251))
             .map_err(|e| JsValue::from_str(&format!("background error: {e}")))?;
+        let (x_start, x_end) = rendered_range()
+            .or_else(|| {
+                candles.first().zip(candles.last()).map(|(first, last)| {
+                    let start = first.timestamp.min(last.timestamp);
+                    let end = first.timestamp.max(last.timestamp);
+                    (start, (start + 60).max(end))
+                })
+            })
+            .unwrap_or((0, 60));
 
-        if candles.is_empty() {
+        let price_bounds = if candles.is_empty() {
+            LAST_CANDLES.with(|state| {
+                let loaded = state.borrow();
+                if loaded.is_empty() {
+                    None
+                } else {
+                    let low = loaded
+                        .iter()
+                        .map(|c| c.low)
+                        .fold(f64::INFINITY, |acc, v| acc.min(v));
+                    let high = loaded
+                        .iter()
+                        .map(|c| c.high)
+                        .fold(f64::NEG_INFINITY, |acc, v| acc.max(v));
+                    Some((low, high))
+                }
+            })
+        } else {
+            Some((
+                candles
+                    .iter()
+                    .map(|c| c.low)
+                    .fold(f64::INFINITY, |acc, v| acc.min(v)),
+                candles
+                    .iter()
+                    .map(|c| c.high)
+                    .fold(f64::NEG_INFINITY, |acc, v| acc.max(v)),
+            ))
+        };
+        let Some((raw_y_min, raw_y_max)) = price_bounds else {
             CHART_VIEW.with(|view| {
                 *view.borrow_mut() = None;
             });
             root.draw(&Text::new(
-                "No candles in selected range",
+                "No candles loaded",
                 (24, 32),
                 ("sans-serif", 22).into_font().color(&BLACK),
             ))
@@ -1295,16 +1387,7 @@ mod web_app {
                 .map_err(|e| JsValue::from_str(&format!("present error: {e}")))?;
             draw_rsi(candles)?;
             return Ok(());
-        }
-
-        let raw_y_min = candles
-            .iter()
-            .map(|c| c.low)
-            .fold(f64::INFINITY, |acc, v| acc.min(v));
-        let raw_y_max = candles
-            .iter()
-            .map(|c| c.high)
-            .fold(f64::NEG_INFINITY, |acc, v| acc.max(v));
+        };
         let fib_levels = active_fib_levels();
 
         // Keep autoscaling tied to market data so Fib extensions don't flatten the chart.
@@ -1318,9 +1401,7 @@ mod web_app {
         let y_span_log = (y_max_log - y_min_log).abs();
         let y_pad_log = (y_span_log * 0.06).max(1.0);
 
-        let x_max = candles.len() as i32;
         let use_log_scale = log_scale && y_min_log > 0.0;
-        let x_timestamps: Vec<i64> = candles.iter().map(|c| c.timestamp).collect();
         let (y_low, y_high) = if use_log_scale {
             (y_min_log, y_max_log + y_pad_log)
         } else {
@@ -1328,26 +1409,28 @@ mod web_app {
         };
         CHART_VIEW.with(|view| {
             *view.borrow_mut() = Some(ChartView {
+                x_start,
+                x_end,
                 y_low,
                 y_high,
                 use_log_scale,
             });
         });
-        let ma_series: Vec<(RGBColor, Vec<(i32, f64)>)> = ma_configs
+        let ma_series: Vec<(RGBColor, Vec<(i64, f64)>)> = ma_configs
             .iter()
             .filter(|cfg| cfg.enabled)
             .map(|cfg| (cfg.color, sma_points(candles, cfg.period)))
             .filter(|(_, points)| !points.is_empty())
             .collect();
-        let fib_x_right = x_max.saturating_sub(1);
         let visible_fib_levels = visible_fib_levels(&fib_levels, y_low, y_high, use_log_scale);
+        let fib_label_x = x_start + ((x_end - x_start).max(60) / 120).max(1);
 
         if use_log_scale {
             let mut chart = ChartBuilder::on(&root)
                 .margin(16)
                 .x_label_area_size(36)
                 .y_label_area_size(72)
-                .build_cartesian_2d(0..x_max, (y_min_log..(y_max_log + y_pad_log)).log_scale())
+                .build_cartesian_2d(x_start..x_end, (y_min_log..(y_max_log + y_pad_log)).log_scale())
                 .map_err(|e| JsValue::from_str(&format!("chart build error: {e}")))?;
 
             chart
@@ -1355,17 +1438,14 @@ mod web_app {
                 .x_labels(8)
                 .y_labels(8)
                 .disable_x_mesh()
-                .x_label_formatter(&|x| {
-                    let idx = (*x).clamp(0, (x_timestamps.len().saturating_sub(1)) as i32) as usize;
-                    unix_seconds_to_date_text(x_timestamps[idx])
-                })
+                .x_label_formatter(&|x| unix_seconds_to_date_text(*x))
                 .draw()
                 .map_err(|e| JsValue::from_str(&format!("mesh draw error: {e}")))?;
 
             chart
-                .draw_series(candles.iter().enumerate().map(|(idx, c)| {
+                .draw_series(candles.iter().map(|c| {
                     CandleStick::new(
-                        idx as i32,
+                        c.timestamp,
                         c.open,
                         c.high,
                         c.low,
@@ -1386,7 +1466,7 @@ mod web_app {
             for (ratio, level_price) in &visible_fib_levels {
                 chart
                     .draw_series(LineSeries::new(
-                            vec![(0, *level_price), (fib_x_right, *level_price)],
+                            vec![(x_start, *level_price), (x_end, *level_price)],
                             &RGBColor(173, 104, 32),
                         ))
                     .map_err(|e| JsValue::from_str(&format!("fib draw error: {e}")))?;
@@ -1398,7 +1478,7 @@ mod web_app {
                             ratio * 100.0,
                             level_price
                         ),
-                        (2, *level_price),
+                        (fib_label_x, *level_price),
                         ("sans-serif", 11).into_font().color(&RGBColor(122, 72, 24)),
                     )))
                     .map_err(|e| JsValue::from_str(&format!("fib label draw error: {e}")))?;
@@ -1408,7 +1488,7 @@ mod web_app {
                 .margin(16)
                 .x_label_area_size(36)
                 .y_label_area_size(72)
-                .build_cartesian_2d(0..x_max, (y_min_linear - y_pad_linear)..(y_max_linear + y_pad_linear))
+                .build_cartesian_2d(x_start..x_end, (y_min_linear - y_pad_linear)..(y_max_linear + y_pad_linear))
                 .map_err(|e| JsValue::from_str(&format!("chart build error: {e}")))?;
 
             chart
@@ -1416,17 +1496,14 @@ mod web_app {
                 .x_labels(8)
                 .y_labels(8)
                 .disable_x_mesh()
-                .x_label_formatter(&|x| {
-                    let idx = (*x).clamp(0, (x_timestamps.len().saturating_sub(1)) as i32) as usize;
-                    unix_seconds_to_date_text(x_timestamps[idx])
-                })
+                .x_label_formatter(&|x| unix_seconds_to_date_text(*x))
                 .draw()
                 .map_err(|e| JsValue::from_str(&format!("mesh draw error: {e}")))?;
 
             chart
-                .draw_series(candles.iter().enumerate().map(|(idx, c)| {
+                .draw_series(candles.iter().map(|c| {
                     CandleStick::new(
-                        idx as i32,
+                        c.timestamp,
                         c.open,
                         c.high,
                         c.low,
@@ -1447,7 +1524,7 @@ mod web_app {
             for (ratio, level_price) in &visible_fib_levels {
                 chart
                     .draw_series(LineSeries::new(
-                            vec![(0, *level_price), (fib_x_right, *level_price)],
+                            vec![(x_start, *level_price), (x_end, *level_price)],
                             &RGBColor(173, 104, 32),
                         ))
                     .map_err(|e| JsValue::from_str(&format!("fib draw error: {e}")))?;
@@ -1459,7 +1536,7 @@ mod web_app {
                             ratio * 100.0,
                             level_price
                         ),
-                        (2, *level_price),
+                        (fib_label_x, *level_price),
                         ("sans-serif", 11).into_font().color(&RGBColor(122, 72, 24)),
                     )))
                     .map_err(|e| JsValue::from_str(&format!("fib label draw error: {e}")))?;
@@ -1574,11 +1651,15 @@ mod web_app {
             .await
             .map_err(|e| JsValue::from_str(&format!("invalid JSON response: {e}")))?;
 
-        let (ts_start, ts_end) = selected_ts_range()?;
         LAST_CANDLES.with(|state| {
             *state.borrow_mut() = candles.clone();
         });
-        let (view_start, view_end) = clamp_range_to_loaded(ts_start, ts_end);
+        let (view_start, view_end) = candle_bounds(&candles)
+            .map(|(start, end)| (start, (start + 60).max(end)))
+            .unwrap_or_else(|| {
+                let now_secs = (Date::now() / 1000.0) as i64;
+                (now_secs.saturating_sub(60), now_secs)
+            });
         CLIENT_VIEW_RANGE.with(|state| {
             *state.borrow_mut() = Some((view_start, view_end));
         });
@@ -2176,13 +2257,12 @@ mod web_app {
                     return;
                 }
 
-                let idx = match candle_index_from_canvas_x(
-                    candles.len(),
+                let cursor_ts = match timestamp_from_canvas_x(
                     canvas_width,
                     canvas_height,
                     crosshair_x as f64,
                 ) {
-                    Some(idx) => idx,
+                    Some(ts) => ts,
                     None => {
                         if set_fib_preview_point(None) {
                             need_fib_redraw = true;
@@ -2197,54 +2277,57 @@ mod web_app {
                         return;
                     }
                 };
-
-                if let Some(candle) = candles.get(idx) {
-                    let text = unix_seconds_to_hover_text(candle.timestamp);
-                    let usd_price = match price_from_canvas_y(
-                        crosshair_y as f64,
-                        plot_top,
-                        plot_bottom,
-                    ) {
-                        Some(v) => {
-                            show_cursor_hline(
-                                overlay_y,
-                                canvas_left + plot_left,
-                                canvas_left + plot_right,
-                            );
-                            v
-                        }
-                        None => {
-                            hide_cursor_hline();
-                            candle.close
-                        }
-                    };
-
-                    let tooltip_text = format!("{} | USD {:.2}", text, usd_price);
-                    let label_text = tooltip_text.clone();
-                    let fib_text = fib_popup_text_for_cursor(candle.timestamp, usd_price);
-                    let fib_preview = FIB_STATE.with(|fib| {
-                        let cfg = *fib.borrow();
-                        if cfg.enabled && cfg.anchor_a.is_some() && cfg.anchor_b.is_none() {
-                            Some((candle.timestamp, usd_price))
-                        } else {
-                            None
-                        }
-                    });
-                    if set_fib_preview_point(fib_preview) {
-                        need_fib_redraw = true;
+                let snapped_candle = nearest_candle_for_timestamp(&candles, cursor_ts);
+                let text = unix_seconds_to_hover_text(cursor_ts);
+                let default_price = snapped_candle.map(|c| c.close).unwrap_or_else(|| {
+                    candles.last().map(|c| c.close).unwrap_or(0.0)
+                });
+                let usd_price = match price_from_canvas_y(crosshair_y as f64, plot_top, plot_bottom) {
+                    Some(v) => {
+                        show_cursor_hline(
+                            overlay_y,
+                            canvas_left + plot_left,
+                            canvas_left + plot_right,
+                        );
+                        v
                     }
+                    None => {
+                        hide_cursor_hline();
+                        default_price
+                    }
+                };
 
-                    set_hover_info(&format!("Hover time: {} | USD {:.2}", text, usd_price));
-                    set_fib_popup_info(&fib_text);
-                    show_hover_tooltip(&tooltip_text, overlay_x, overlay_y);
-                    show_cursor_time_label(&label_text, overlay_x);
-                    show_cursor_vline(
-                        overlay_x,
-                        canvas_top + plot_top,
-                        canvas_top + plot_bottom,
-                    );
-                    show_rsi_cursor_vline(crosshair_x);
+                let tooltip_text = match snapped_candle {
+                    Some(candle) => format!(
+                        "{} | O {:.2} H {:.2} L {:.2} C {:.2} | USD {:.2}",
+                        text, candle.open, candle.high, candle.low, candle.close, usd_price
+                    ),
+                    None => format!("{} | USD {:.2}", text, usd_price),
+                };
+                let label_text = format!("{} | USD {:.2}", text, usd_price);
+                let fib_text = fib_popup_text_for_cursor(cursor_ts, usd_price);
+                let fib_preview = FIB_STATE.with(|fib| {
+                    let cfg = *fib.borrow();
+                    if cfg.enabled && cfg.anchor_a.is_some() && cfg.anchor_b.is_none() {
+                        Some((cursor_ts, usd_price))
+                    } else {
+                        None
+                    }
+                });
+                if set_fib_preview_point(fib_preview) {
+                    need_fib_redraw = true;
                 }
+
+                set_hover_info(&format!("Hover time: {} | USD {:.2}", text, usd_price));
+                set_fib_popup_info(&fib_text);
+                show_hover_tooltip(&tooltip_text, overlay_x, overlay_y);
+                show_cursor_time_label(&label_text, overlay_x);
+                show_cursor_vline(
+                    overlay_x,
+                    canvas_top + plot_top,
+                    canvas_top + plot_bottom,
+                );
+                show_rsi_cursor_vline(crosshair_x);
             });
             if need_fib_redraw {
                 if let Err(err) = redraw_visible_chart_only() {
@@ -2279,8 +2362,7 @@ mod web_app {
 
                     let crosshair_x = (event.offset_x() as f64).clamp(plot_left, plot_right);
                     let crosshair_y = (event.offset_y() as f64).clamp(plot_top, plot_bottom);
-                    let idx = match candle_index_from_canvas_x(
-                        candles.len(),
+                    let cursor_ts = match timestamp_from_canvas_x(
                         canvas_width,
                         canvas_height,
                         crosshair_x,
@@ -2288,31 +2370,27 @@ mod web_app {
                         Some(v) => v,
                         None => return,
                     };
-                    let candle = match candles.get(idx) {
-                        Some(v) => v,
-                        None => return,
-                    };
                     let price = price_from_canvas_y(crosshair_y, plot_top, plot_bottom)
-                        .unwrap_or(candle.close);
+                        .unwrap_or_else(|| candles.last().map(|c| c.close).unwrap_or(0.0));
 
                     let status_message = FIB_STATE.with(|fib| {
                         let mut cfg = fib.borrow_mut();
                         if cfg.anchor_a.is_none() || cfg.anchor_b.is_some() {
-                            cfg.anchor_a = Some((candle.timestamp, price));
+                            cfg.anchor_a = Some((cursor_ts, price));
                             cfg.anchor_b = None;
                             format!(
                                 "Fib first point set: {} @ {:.2}. Click second point",
-                                unix_seconds_to_hover_text(candle.timestamp),
+                                unix_seconds_to_hover_text(cursor_ts),
                                 price
                             )
                         } else {
-                            cfg.anchor_b = Some((candle.timestamp, price));
+                            cfg.anchor_b = Some((cursor_ts, price));
                             let (anchor_ts, anchor_price) = cfg.anchor_a.unwrap();
                             format!(
                                 "Fib ready: {} @ {:.2} -> {} @ {:.2}",
                                 unix_seconds_to_hover_text(anchor_ts),
                                 anchor_price,
-                                unix_seconds_to_hover_text(candle.timestamp),
+                                unix_seconds_to_hover_text(cursor_ts),
                                 price
                             )
                         }

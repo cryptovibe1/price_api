@@ -86,6 +86,13 @@ mod web_app {
         }
     }
 
+    #[derive(Clone)]
+    struct FibOverlay {
+        x_start: i64,
+        x_end: i64,
+        levels: Vec<(f64, f64)>,
+    }
+
     fn document() -> Result<Document, JsValue> {
         web_sys::window()
             .ok_or_else(|| JsValue::from_str("window is not available"))?
@@ -190,23 +197,24 @@ mod web_app {
         Ok(())
     }
 
-    fn active_fib_levels() -> Option<Vec<(f64, f64)>> {
+    fn active_fib_overlay() -> Option<FibOverlay> {
         FIB_STATE.with(|state| {
             let cfg = *state.borrow();
-            if !cfg.enabled {
-                return None;
-            }
-
-            let (_, price_a) = cfg.anchor_a?;
-            let (_, price_b) = match cfg.anchor_b {
-                Some(v) => v,
-                None => FIB_PREVIEW_POINT.with(|preview| *preview.borrow())?,
+            let (ts_a, price_a) = cfg.anchor_a?;
+            let (ts_b, price_b) = match (cfg.anchor_b, cfg.enabled) {
+                (Some(v), _) => v,
+                (None, true) => FIB_PREVIEW_POINT.with(|preview| *preview.borrow())?,
+                (None, false) => return None,
             };
             let delta = price_b - price_a;
             let ratios = [
                 0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.681, 2.618, 3.618, 4.236,
             ];
-            Some(ratios.into_iter().map(|r| (r, price_b - delta * r)).collect())
+            Some(FibOverlay {
+                x_start: ts_a.min(ts_b),
+                x_end: ts_a.max(ts_b),
+                levels: ratios.into_iter().map(|r| (r, price_b - delta * r)).collect(),
+            })
         })
     }
 
@@ -243,15 +251,16 @@ mod web_app {
     }
 
     fn visible_fib_levels(
-        fib_levels: &Option<Vec<(f64, f64)>>,
+        fib_overlay: &Option<FibOverlay>,
         y_low: f64,
         y_high: f64,
         log_scale: bool,
     ) -> Vec<(f64, f64)> {
-        fib_levels
+        fib_overlay
             .as_ref()
-            .map(|levels| {
-                levels
+            .map(|overlay| {
+                overlay
+                    .levels
                     .iter()
                     .copied()
                     .filter(|(_, level_price)| {
@@ -1388,7 +1397,7 @@ mod web_app {
             draw_rsi(candles)?;
             return Ok(());
         };
-        let fib_levels = active_fib_levels();
+        let fib_overlay = active_fib_overlay();
 
         // Keep autoscaling tied to market data so Fib extensions don't flatten the chart.
         let y_min_linear = raw_y_min;
@@ -1422,8 +1431,16 @@ mod web_app {
             .map(|cfg| (cfg.color, sma_points(candles, cfg.period)))
             .filter(|(_, points)| !points.is_empty())
             .collect();
-        let visible_fib_levels = visible_fib_levels(&fib_levels, y_low, y_high, use_log_scale);
-        let fib_label_x = x_start + ((x_end - x_start).max(60) / 120).max(1);
+        let visible_fib_levels = visible_fib_levels(&fib_overlay, y_low, y_high, use_log_scale);
+        let (fib_x_start, fib_x_end, fib_label_x) = fib_overlay
+            .as_ref()
+            .map(|overlay| {
+                let start = overlay.x_start.clamp(x_start, x_end);
+                let end = overlay.x_end.clamp(x_start, x_end);
+                let label_x = start + ((end - start).max(60) / 40).max(1);
+                (start.min(end), start.max(end), label_x.min(x_end))
+            })
+            .unwrap_or((x_start, x_end, x_start));
 
         if use_log_scale {
             let mut chart = ChartBuilder::on(&root)
@@ -1463,10 +1480,25 @@ mod web_app {
                     .map_err(|e| JsValue::from_str(&format!("ma draw error: {e}")))?;
             }
 
+            if fib_overlay.is_some() && fib_x_end > fib_x_start {
+                chart
+                    .draw_series([
+                        PathElement::new(
+                            vec![(fib_x_start, y_low), (fib_x_start, y_high)],
+                            RGBColor(173, 104, 32).mix(0.25),
+                        ),
+                        PathElement::new(
+                            vec![(fib_x_end, y_low), (fib_x_end, y_high)],
+                            RGBColor(173, 104, 32).mix(0.25),
+                        ),
+                    ])
+                    .map_err(|e| JsValue::from_str(&format!("fib boundary draw error: {e}")))?;
+            }
+
             for (ratio, level_price) in &visible_fib_levels {
                 chart
                     .draw_series(LineSeries::new(
-                            vec![(x_start, *level_price), (x_end, *level_price)],
+                            vec![(fib_x_start, *level_price), (fib_x_end, *level_price)],
                             &RGBColor(173, 104, 32),
                         ))
                     .map_err(|e| JsValue::from_str(&format!("fib draw error: {e}")))?;
@@ -1521,10 +1553,25 @@ mod web_app {
                     .map_err(|e| JsValue::from_str(&format!("ma draw error: {e}")))?;
             }
 
+            if fib_overlay.is_some() && fib_x_end > fib_x_start {
+                chart
+                    .draw_series([
+                        PathElement::new(
+                            vec![(fib_x_start, y_low), (fib_x_start, y_high)],
+                            RGBColor(173, 104, 32).mix(0.25),
+                        ),
+                        PathElement::new(
+                            vec![(fib_x_end, y_low), (fib_x_end, y_high)],
+                            RGBColor(173, 104, 32).mix(0.25),
+                        ),
+                    ])
+                    .map_err(|e| JsValue::from_str(&format!("fib boundary draw error: {e}")))?;
+            }
+
             for (ratio, level_price) in &visible_fib_levels {
                 chart
                     .draw_series(LineSeries::new(
-                            vec![(x_start, *level_price), (x_end, *level_price)],
+                            vec![(fib_x_start, *level_price), (fib_x_end, *level_price)],
                             &RGBColor(173, 104, 32),
                         ))
                     .map_err(|e| JsValue::from_str(&format!("fib draw error: {e}")))?;
@@ -1801,12 +1848,8 @@ mod web_app {
                 }
             } else {
                 let delta = event.delta_y();
-                let amount = (delta.abs().min(240.0) / 1200.0).max(0.02);
-                let factor = if delta > 0.0 {
-                    1.0 + amount
-                } else {
-                    1.0 / (1.0 + amount)
-                };
+                let normalized_delta = delta.clamp(-240.0, 240.0);
+                let factor = (normalized_delta / 2400.0).exp();
                 let (new_start, new_end) = zoomed_range_from(cur_start, cur_end, factor);
                 if let Err(err) = apply_range_change_client_only(new_start, new_end) {
                     set_status(&format!("failed to zoom: {:?}", err));
@@ -1844,21 +1887,33 @@ mod web_app {
             FIB_STATE.with(|state| {
                 let mut cfg = state.borrow_mut();
                 cfg.enabled = !cfg.enabled;
-                cfg.anchor_a = None;
-                cfg.anchor_b = None;
             });
-            let _ = set_fib_preview_point(None);
+            let fib_enabled = FIB_STATE.with(|state| state.borrow().enabled);
+            if !fib_enabled {
+                let _ = set_fib_preview_point(None);
+            }
             if let Err(err) = sync_fib_button() {
                 set_status(&format!("failed: {:?}", err));
                 return;
             }
-            let fib_enabled = FIB_STATE.with(|state| state.borrow().enabled);
             if fib_enabled {
-                set_status("Fib tool: click first point, then second point");
-                set_fib_popup_info("Fib is on. Click first point on chart.");
+                let has_anchor_a =
+                    FIB_STATE.with(|state| state.borrow().anchor_a.is_some());
+                let has_anchor_b =
+                    FIB_STATE.with(|state| state.borrow().anchor_b.is_some());
+                if has_anchor_a && has_anchor_b {
+                    set_status("Fib tool enabled");
+                    set_fib_popup_info("Fib restored. Click chart to start a new Fib.");
+                } else if has_anchor_a {
+                    set_status("Fib tool: click second point");
+                    set_fib_popup_info("Fib restored. Click second point on chart.");
+                } else {
+                    set_status("Fib tool: click first point, then second point");
+                    set_fib_popup_info("Fib is on. Click first point on chart.");
+                }
             } else {
                 set_status("Fib tool disabled");
-                set_fib_popup_info("Fib is off. Toggle Fib to start.");
+                set_fib_popup_info("Fib is off. Existing anchors preserved.");
             }
             spawn_local(async {
                 if let Err(err) = rerender_cached_or_fetch().await {

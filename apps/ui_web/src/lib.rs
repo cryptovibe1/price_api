@@ -31,6 +31,10 @@ mod web_app {
         static LAST_RENDERED_CANDLES: RefCell<Vec<Candle>> = const { RefCell::new(Vec::new()) };
         static CLIENT_VIEW_RANGE: RefCell<Option<(i64, i64)>> = const { RefCell::new(None) };
         static PAN_LAST_X: RefCell<Option<i32>> = const { RefCell::new(None) };
+        static DRAG_PAN_REMAINDER: RefCell<f64> = const { RefCell::new(0.0) };
+        static WHEEL_PAN_REMAINDER: RefCell<f64> = const { RefCell::new(0.0) };
+        static Y_STRETCH_FACTOR: RefCell<f64> = const { RefCell::new(1.0) };
+        static Y_STRETCH_DRAG: RefCell<Option<YStretchDrag>> = const { RefCell::new(None) };
         static FIB_STATE: RefCell<FibState> = const { RefCell::new(FibState::new()) };
         static FIB_PREVIEW_POINT: RefCell<Option<(i64, f64)>> = const { RefCell::new(None) };
         static FIB_POPUP_DRAG: RefCell<Option<(f64, f64)>> = const { RefCell::new(None) };
@@ -67,6 +71,12 @@ mod web_app {
         y_low: f64,
         y_high: f64,
         use_log_scale: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    struct YStretchDrag {
+        start_y: i32,
+        start_factor: f64,
     }
 
     #[derive(Clone, Copy)]
@@ -1304,6 +1314,38 @@ mod web_app {
         })
     }
 
+    fn set_y_stretch_factor(next: f64) -> bool {
+        let clamped = next.clamp(0.2, 25.0);
+        Y_STRETCH_FACTOR.with(|state| {
+            let mut factor = state.borrow_mut();
+            if (*factor - clamped).abs() < 0.001 {
+                false
+            } else {
+                *factor = clamped;
+                true
+            }
+        })
+    }
+
+    fn apply_panned_range_delta(
+        ts_start: i64,
+        ts_end: i64,
+        delta_seconds: f64,
+        remainder: &'static std::thread::LocalKey<RefCell<f64>>,
+    ) -> Result<bool, JsValue> {
+        remainder.with(|state| {
+            let mut carry = state.borrow_mut();
+            let total = *carry + delta_seconds;
+            let whole_seconds = total.trunc() as i64;
+            *carry = total - whole_seconds as f64;
+            if whole_seconds == 0 {
+                return Ok(false);
+            }
+            apply_range_change_client_only(ts_start + whole_seconds, ts_end + whole_seconds)?;
+            Ok(true)
+        })
+    }
+
     fn inferred_candle_spacing(candles: &[Candle]) -> i64 {
         candles
             .windows(2)
@@ -1411,10 +1453,24 @@ mod web_app {
         let y_pad_log = (y_span_log * 0.06).max(1.0);
 
         let use_log_scale = log_scale && y_min_log > 0.0;
+        let stretch_factor = Y_STRETCH_FACTOR.with(|state| *state.borrow()).clamp(0.2, 25.0);
         let (y_low, y_high) = if use_log_scale {
-            (y_min_log, y_max_log + y_pad_log)
+            let base_low = y_min_log;
+            let base_high = y_max_log + y_pad_log;
+            let low_ln = base_low.ln();
+            let high_ln = base_high.ln();
+            let center_ln = (low_ln + high_ln) / 2.0;
+            let half_span_ln = ((high_ln - low_ln) / 2.0) * stretch_factor;
+            (
+                (center_ln - half_span_ln).exp(),
+                (center_ln + half_span_ln).exp(),
+            )
         } else {
-            (y_min_linear - y_pad_linear, y_max_linear + y_pad_linear)
+            let base_low = y_min_linear - y_pad_linear;
+            let base_high = y_max_linear + y_pad_linear;
+            let center = (base_low + base_high) / 2.0;
+            let half_span = ((base_high - base_low) / 2.0).max(1.0) * stretch_factor;
+            (center - half_span, center + half_span)
         };
         CHART_VIEW.with(|view| {
             *view.borrow_mut() = Some(ChartView {
@@ -1447,7 +1503,7 @@ mod web_app {
                 .margin(16)
                 .x_label_area_size(36)
                 .y_label_area_size(72)
-                .build_cartesian_2d(x_start..x_end, (y_min_log..(y_max_log + y_pad_log)).log_scale())
+                .build_cartesian_2d(x_start..x_end, (y_low..y_high).log_scale())
                 .map_err(|e| JsValue::from_str(&format!("chart build error: {e}")))?;
 
             chart
@@ -1520,7 +1576,7 @@ mod web_app {
                 .margin(16)
                 .x_label_area_size(36)
                 .y_label_area_size(72)
-                .build_cartesian_2d(x_start..x_end, (y_min_linear - y_pad_linear)..(y_max_linear + y_pad_linear))
+                .build_cartesian_2d(x_start..x_end, y_low..y_high)
                 .map_err(|e| JsValue::from_str(&format!("chart build error: {e}")))?;
 
             chart
@@ -1841,9 +1897,14 @@ mod web_app {
                 } else {
                     event.delta_y()
                 };
-                let direction = if delta > 0.0 { 1 } else { -1 };
-                let (new_start, new_end) = panned_range_from(cur_start, cur_end, direction);
-                if let Err(err) = apply_range_change_client_only(new_start, new_end) {
+                let span = (cur_end - cur_start).max(60) as f64;
+                let delta_seconds = (delta / 240.0) * (span * 0.10).max(60.0);
+                if let Err(err) = apply_panned_range_delta(
+                    cur_start,
+                    cur_end,
+                    delta_seconds,
+                    &WHEEL_PAN_REMAINDER,
+                ) {
                     set_status(&format!("failed to pan: {:?}", err));
                 }
             } else {
@@ -2222,6 +2283,9 @@ mod web_app {
             FIB_POPUP_DRAG.with(|state| {
                 *state.borrow_mut() = None;
             });
+            Y_STRETCH_DRAG.with(|state| {
+                *state.borrow_mut() = None;
+            });
         }) as Box<dyn FnMut(MouseEvent)>);
 
         doc.add_event_listener_with_callback("mouseup", drag_end_callback.as_ref().unchecked_ref())?;
@@ -2285,13 +2349,13 @@ mod web_app {
                             if let Some((cur_start, cur_end)) = rendered_range() {
                                 let span = (cur_end - cur_start).max(60) as f64;
                                 let plot_width = (plot_right - plot_left).max(1.0);
-                                let shift_seconds = (-(dx as f64) / plot_width * span).round() as i64;
-                                if shift_seconds != 0 {
-                                    let _ = apply_range_change_client_only(
-                                        cur_start + shift_seconds,
-                                        cur_end + shift_seconds,
-                                    );
-                                }
+                                let shift_seconds = (-(dx as f64) / plot_width) * span;
+                                let _ = apply_panned_range_delta(
+                                    cur_start,
+                                    cur_end,
+                                    shift_seconds,
+                                    &DRAG_PAN_REMAINDER,
+                                );
                             }
                         }
                         *last = Some(event.offset_x());
@@ -2304,6 +2368,30 @@ mod web_app {
                         need_fib_redraw = true;
                     }
                     set_fib_popup_info("Pan mode active. Release Shift to place Fib points.");
+                    hide_hover_tooltip();
+                    hide_cursor_time_label();
+                    hide_cursor_vline();
+                    hide_cursor_hline();
+                    hide_rsi_cursor_vline();
+                    return;
+                }
+
+                let mut is_y_stretch_mode = false;
+                Y_STRETCH_DRAG.with(|state| {
+                    let drag = *state.borrow();
+                    if let Some(drag) = drag {
+                        let dy = event.offset_y() - drag.start_y;
+                        let next_factor = drag.start_factor * (dy as f64 / 180.0).exp();
+                        if set_y_stretch_factor(next_factor) {
+                            if let Err(err) = redraw_visible_chart_only() {
+                                set_status(&format!("failed: {:?}", err));
+                            }
+                        }
+                        is_y_stretch_mode = true;
+                    }
+                });
+
+                if is_y_stretch_mode {
                     hide_hover_tooltip();
                     hide_cursor_time_label();
                     hide_cursor_vline();
@@ -2475,11 +2563,34 @@ mod web_app {
                 }
 
                 if event.shift_key() {
+                    DRAG_PAN_REMAINDER.with(|state| {
+                        *state.borrow_mut() = 0.0;
+                    });
                     PAN_LAST_X.with(|pan| {
                         *pan.borrow_mut() = Some(event.offset_x());
                     });
                     set_chart_cursor("grabbing");
                     set_status("Pan mode: move mouse left/right");
+                } else {
+                    let canvas_width = fib_canvas.client_width() as f64;
+                    let canvas_height = fib_canvas.client_height() as f64;
+                    let (_, _, plot_top, plot_bottom) = match plot_bounds(canvas_width, canvas_height)
+                    {
+                        Some(v) => v,
+                        None => return,
+                    };
+                    let offset_y = event.offset_y() as f64;
+                    if offset_y >= plot_top && offset_y <= plot_bottom {
+                        let start_factor = Y_STRETCH_FACTOR.with(|state| *state.borrow());
+                        Y_STRETCH_DRAG.with(|state| {
+                            *state.borrow_mut() = Some(YStretchDrag {
+                                start_y: event.offset_y(),
+                                start_factor,
+                            });
+                        });
+                        set_chart_cursor("ns-resize");
+                        set_status("Y stretch: drag up or down");
+                    }
                 }
             });
         }) as Box<dyn FnMut(MouseEvent)>);
@@ -2496,8 +2607,14 @@ mod web_app {
                 PAN_LAST_X.with(|pan| {
                     *pan.borrow_mut() = None;
                 });
+                DRAG_PAN_REMAINDER.with(|state| {
+                    *state.borrow_mut() = 0.0;
+                });
                 set_chart_cursor("default");
             }
+            Y_STRETCH_DRAG.with(|state| {
+                *state.borrow_mut() = None;
+            });
             set_chart_cursor("default");
         }) as Box<dyn FnMut(MouseEvent)>);
 
@@ -2511,6 +2628,12 @@ mod web_app {
             let clear_preview = set_fib_preview_point(None);
             PAN_LAST_X.with(|pan| {
                 *pan.borrow_mut() = None;
+            });
+            DRAG_PAN_REMAINDER.with(|state| {
+                *state.borrow_mut() = 0.0;
+            });
+            Y_STRETCH_DRAG.with(|state| {
+                *state.borrow_mut() = None;
             });
             set_chart_cursor("default");
             set_hover_info("Hover chart to see candle time");

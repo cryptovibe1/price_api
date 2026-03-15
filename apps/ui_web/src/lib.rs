@@ -2428,29 +2428,42 @@ mod web_app {
                     let price = price_from_canvas_y(crosshair_y, plot_top, plot_bottom)
                         .unwrap_or_else(|| candles.last().map(|c| c.close).unwrap_or(0.0));
 
-                    let status_message = FIB_STATE.with(|fib| {
+                    let (status_message, fib_completed) = FIB_STATE.with(|fib| {
                         let mut cfg = fib.borrow_mut();
                         if cfg.anchor_a.is_none() || cfg.anchor_b.is_some() {
                             cfg.anchor_a = Some((cursor_ts, price));
                             cfg.anchor_b = None;
-                            format!(
-                                "Fib first point set: {} @ {:.2}. Click second point",
-                                unix_seconds_to_hover_text(cursor_ts),
-                                price
+                            (
+                                format!(
+                                    "Fib first point set: {} @ {:.2}. Click second point",
+                                    unix_seconds_to_hover_text(cursor_ts),
+                                    price
+                                ),
+                                false,
                             )
                         } else {
                             cfg.anchor_b = Some((cursor_ts, price));
+                            cfg.enabled = false;
                             let (anchor_ts, anchor_price) = cfg.anchor_a.unwrap();
-                            format!(
-                                "Fib ready: {} @ {:.2} -> {} @ {:.2}",
-                                unix_seconds_to_hover_text(anchor_ts),
-                                anchor_price,
-                                unix_seconds_to_hover_text(cursor_ts),
-                                price
+                            (
+                                format!(
+                                    "Fib ready: {} @ {:.2} -> {} @ {:.2}",
+                                    unix_seconds_to_hover_text(anchor_ts),
+                                    anchor_price,
+                                    unix_seconds_to_hover_text(cursor_ts),
+                                    price
+                                ),
+                                true,
                             )
                         }
                     });
 
+                    if fib_completed {
+                        if let Err(err) = sync_fib_button() {
+                            set_status(&format!("failed: {:?}", err));
+                            return;
+                        }
+                    }
                     set_status(&status_message);
                     set_fib_popup_info(&status_message);
                     spawn_local(async {

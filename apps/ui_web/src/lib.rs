@@ -33,7 +33,11 @@ mod web_app {
         static PAN_LAST_X: RefCell<Option<i32>> = const { RefCell::new(None) };
         static DRAG_PAN_REMAINDER: RefCell<f64> = const { RefCell::new(0.0) };
         static WHEEL_PAN_REMAINDER: RefCell<f64> = const { RefCell::new(0.0) };
+        static DRAG_TOOL_ENABLED: RefCell<bool> = const { RefCell::new(false) };
+        static CHART_DRAG: RefCell<Option<ChartDragState>> = const { RefCell::new(None) };
         static Y_STRETCH_FACTOR: RefCell<f64> = const { RefCell::new(1.0) };
+        static Y_PAN_LINEAR_OFFSET: RefCell<f64> = const { RefCell::new(0.0) };
+        static Y_PAN_LOG_OFFSET: RefCell<f64> = const { RefCell::new(0.0) };
         static Y_STRETCH_DRAG: RefCell<Option<YStretchDrag>> = const { RefCell::new(None) };
         static FIB_STATE: RefCell<FibState> = const { RefCell::new(FibState::new()) };
         static FIB_PREVIEW_POINT: RefCell<Option<(i64, f64)>> = const { RefCell::new(None) };
@@ -77,6 +81,17 @@ mod web_app {
     struct YStretchDrag {
         start_y: i32,
         start_factor: f64,
+    }
+
+    #[derive(Clone, Copy)]
+    struct ChartDragState {
+        start_x: i32,
+        start_y: i32,
+        ts_start: i64,
+        ts_end: i64,
+        y_offset_start: f64,
+        y_span: f64,
+        use_log_scale: bool,
     }
 
     #[derive(Clone, Copy)]
@@ -176,12 +191,14 @@ mod web_app {
 
         if enabled {
             button.set_class_name("toggle-btn active");
-            button.set_text_content(Some("Log On"));
             button.set_attribute("aria-pressed", "true")?;
+            button.set_attribute("aria-label", "Log On")?;
+            button.set_attribute("title", "Log On")?;
         } else {
             button.set_class_name("toggle-btn");
-            button.set_text_content(Some("Log Off"));
             button.set_attribute("aria-pressed", "false")?;
+            button.set_attribute("aria-label", "Log Off")?;
+            button.set_attribute("title", "Log Off")?;
         }
 
         Ok(())
@@ -202,6 +219,50 @@ mod web_app {
             button.set_class_name("toggle-btn");
             button.set_text_content(Some("Fib Off"));
             button.set_attribute("aria-pressed", "false")?;
+        }
+
+        Ok(())
+    }
+
+    fn sync_drag_button() -> Result<(), JsValue> {
+        let doc = document()?;
+        let button = doc
+            .get_element_by_id("drag-toggle")
+            .ok_or_else(|| JsValue::from_str("missing drag toggle button"))?;
+
+        let enabled = DRAG_TOOL_ENABLED.with(|state| *state.borrow());
+        if enabled {
+            button.set_class_name("toggle-btn active");
+            button.set_attribute("aria-pressed", "true")?;
+            button.set_attribute("aria-label", "Drag On")?;
+            button.set_attribute("title", "Drag On")?;
+            set_chart_cursor("move");
+        } else {
+            button.set_class_name("toggle-btn");
+            button.set_attribute("aria-pressed", "false")?;
+            button.set_attribute("aria-label", "Drag Off")?;
+            button.set_attribute("title", "Drag Off")?;
+            set_chart_cursor("default");
+        }
+
+        Ok(())
+    }
+
+    fn set_load_button_loading(loading: bool) -> Result<(), JsValue> {
+        let doc = document()?;
+        let button = doc
+            .get_element_by_id("load")
+            .ok_or_else(|| JsValue::from_str("missing load button"))?
+            .dyn_into::<HtmlElement>()?;
+
+        if loading {
+            button.set_class_name("loading");
+            button.set_attribute("disabled", "true")?;
+            button.set_attribute("aria-busy", "true")?;
+        } else {
+            button.set_class_name("");
+            button.remove_attribute("disabled")?;
+            button.set_attribute("aria-busy", "false")?;
         }
 
         Ok(())
@@ -558,10 +619,10 @@ mod web_app {
 
         if visible {
             body.set_class_name("ma-settings-body settings-body");
-            toggle.set_text_content(Some("Hide Tools"));
+            toggle.set_text_content(Some("Hide"));
         } else {
             body.set_class_name("ma-settings-body settings-body hidden");
-            toggle.set_text_content(Some("Show Tools"));
+            toggle.set_text_content(Some("Show"));
         }
 
         storage()?.set_item(STORAGE_KEY_SETTINGS_VISIBLE, if visible { "1" } else { "0" })?;
@@ -574,17 +635,19 @@ mod web_app {
             .get_element_by_id("ma-settings-card")
             .ok_or_else(|| JsValue::from_str("missing settings card"))?
             .dyn_into::<HtmlElement>()?;
-        let side_toggle = doc
-            .get_element_by_id("settings-side-toggle")
-            .ok_or_else(|| JsValue::from_str("missing settings side toggle"))?;
+        let side_toggle = doc.get_element_by_id("settings-side-toggle");
 
         if side == "left" {
             card.set_class_name("panel ma-settings-card left");
-            side_toggle.set_text_content(Some("Move Right"));
+            if let Some(side_toggle) = &side_toggle {
+                side_toggle.set_text_content(Some("Move Right"));
+            }
             storage()?.set_item(STORAGE_KEY_SETTINGS_SIDE, "left")?;
         } else {
             card.set_class_name("panel ma-settings-card");
-            side_toggle.set_text_content(Some("Move Left"));
+            if let Some(side_toggle) = &side_toggle {
+                side_toggle.set_text_content(Some("Move Left"));
+            }
             storage()?.set_item(STORAGE_KEY_SETTINGS_SIDE, "right")?;
         }
         let _ = card.style().remove_property("left");
@@ -668,19 +731,21 @@ mod web_app {
             .get_element_by_id("connection-settings-card")
             .ok_or_else(|| JsValue::from_str("missing connection settings card"))?
             .dyn_into::<HtmlElement>()?;
-        let side_toggle = doc
-            .get_element_by_id("connection-settings-side-toggle")
-            .ok_or_else(|| JsValue::from_str("missing connection settings side toggle"))?;
+        let side_toggle = doc.get_element_by_id("connection-settings-side-toggle");
 
         let collapsed = card.class_name().contains(" collapsed");
 
         if side == "left" {
             card.set_class_name(connection_settings_class_name("left", collapsed));
-            side_toggle.set_text_content(Some("Move Right"));
+            if let Some(side_toggle) = &side_toggle {
+                side_toggle.set_text_content(Some("Move Right"));
+            }
             storage()?.set_item(STORAGE_KEY_CONNECTION_SETTINGS_SIDE, "left")?;
         } else {
             card.set_class_name(connection_settings_class_name("right", collapsed));
-            side_toggle.set_text_content(Some("Move Left"));
+            if let Some(side_toggle) = &side_toggle {
+                side_toggle.set_text_content(Some("Move Left"));
+            }
             storage()?.set_item(STORAGE_KEY_CONNECTION_SETTINGS_SIDE, "right")?;
         }
         let _ = card.style().remove_property("left");
@@ -1327,23 +1392,50 @@ mod web_app {
         })
     }
 
+    fn set_y_pan_linear_offset(next: f64) -> bool {
+        Y_PAN_LINEAR_OFFSET.with(|state| {
+            let mut offset = state.borrow_mut();
+            if (*offset - next).abs() < 0.001 {
+                false
+            } else {
+                *offset = next;
+                true
+            }
+        })
+    }
+
+    fn set_y_pan_log_offset(next: f64) -> bool {
+        Y_PAN_LOG_OFFSET.with(|state| {
+            let mut offset = state.borrow_mut();
+            if (*offset - next).abs() < 0.000_1 {
+                false
+            } else {
+                *offset = next;
+                true
+            }
+        })
+    }
+
     fn apply_panned_range_delta(
         ts_start: i64,
         ts_end: i64,
         delta_seconds: f64,
         remainder: &'static std::thread::LocalKey<RefCell<f64>>,
     ) -> Result<bool, JsValue> {
-        remainder.with(|state| {
+        let whole_seconds = remainder.with(|state| {
             let mut carry = state.borrow_mut();
             let total = *carry + delta_seconds;
             let whole_seconds = total.trunc() as i64;
             *carry = total - whole_seconds as f64;
-            if whole_seconds == 0 {
-                return Ok(false);
-            }
-            apply_range_change_client_only(ts_start + whole_seconds, ts_end + whole_seconds)?;
-            Ok(true)
-        })
+            whole_seconds
+        });
+
+        if whole_seconds == 0 {
+            return Ok(false);
+        }
+
+        apply_range_change_client_only(ts_start + whole_seconds, ts_end + whole_seconds)?;
+        Ok(true)
     }
 
     fn inferred_candle_spacing(candles: &[Candle]) -> i64 {
@@ -1461,16 +1553,17 @@ mod web_app {
             let high_ln = base_high.ln();
             let center_ln = (low_ln + high_ln) / 2.0;
             let half_span_ln = ((high_ln - low_ln) / 2.0) * stretch_factor;
-            (
-                (center_ln - half_span_ln).exp(),
-                (center_ln + half_span_ln).exp(),
-            )
+            let pan_offset_ln = Y_PAN_LOG_OFFSET.with(|state| *state.borrow());
+            let low = center_ln - half_span_ln + pan_offset_ln;
+            let high = center_ln + half_span_ln + pan_offset_ln;
+            (low.exp(), high.exp())
         } else {
             let base_low = y_min_linear - y_pad_linear;
             let base_high = y_max_linear + y_pad_linear;
             let center = (base_low + base_high) / 2.0;
             let half_span = ((base_high - base_low) / 2.0).max(1.0) * stretch_factor;
-            (center - half_span, center + half_span)
+            let pan_offset = Y_PAN_LINEAR_OFFSET.with(|state| *state.borrow());
+            (center - half_span + pan_offset, center + half_span + pan_offset)
         };
         CHART_VIEW.with(|view| {
             *view.borrow_mut() = Some(ChartView {
@@ -1780,6 +1873,7 @@ mod web_app {
     fn setup_defaults() -> Result<(), JsValue> {
         load_saved_inputs()?;
         sync_fib_button()?;
+        sync_drag_button()?;
         set_fib_popup_info("Move cursor over chart to use Fibonacci tool");
 
         let now_secs = (Date::now() / 1000.0) as i64;
@@ -1803,6 +1897,9 @@ mod web_app {
         let log_scale_toggle_button = doc
             .get_element_by_id("log-scale-toggle")
             .ok_or_else(|| JsValue::from_str("missing log scale toggle button"))?;
+        let drag_toggle_button = doc
+            .get_element_by_id("drag-toggle")
+            .ok_or_else(|| JsValue::from_str("missing drag toggle button"))?;
         let fib_toggle_button = doc
             .get_element_by_id("fib-toggle")
             .ok_or_else(|| JsValue::from_str("missing fib toggle button"))?;
@@ -1819,9 +1916,7 @@ mod web_app {
         let settings_toggle_button = doc
             .get_element_by_id("settings-toggle")
             .ok_or_else(|| JsValue::from_str("missing settings toggle button"))?;
-        let settings_side_toggle_button = doc
-            .get_element_by_id("settings-side-toggle")
-            .ok_or_else(|| JsValue::from_str("missing settings side toggle button"))?;
+        let settings_side_toggle_button = doc.get_element_by_id("settings-side-toggle");
         let ma_settings_drag_handle = doc
             .get_element_by_id("ma-settings-drag-handle")
             .ok_or_else(|| JsValue::from_str("missing ma settings drag handle"))?;
@@ -1832,9 +1927,8 @@ mod web_app {
         let connection_settings_toggle_button = doc
             .get_element_by_id("connection-settings-toggle")
             .ok_or_else(|| JsValue::from_str("missing connection settings toggle button"))?;
-        let connection_settings_side_toggle_button = doc
-            .get_element_by_id("connection-settings-side-toggle")
-            .ok_or_else(|| JsValue::from_str("missing connection settings side toggle button"))?;
+        let connection_settings_side_toggle_button =
+            doc.get_element_by_id("connection-settings-side-toggle");
         let connection_settings_drag_handle = doc
             .get_element_by_id("connection-settings-drag-handle")
             .ok_or_else(|| JsValue::from_str("missing connection settings drag handle"))?;
@@ -1848,8 +1942,15 @@ mod web_app {
             .dyn_into::<HtmlCanvasElement>()?;
 
         let load_callback = Closure::wrap(Box::new(move || {
+            if let Err(err) = set_load_button_loading(true) {
+                set_status(&format!("failed: {:?}", err));
+                return;
+            }
             spawn_local(async {
                 if let Err(err) = fetch_and_draw().await {
+                    set_status(&format!("failed: {:?}", err));
+                }
+                if let Err(err) = set_load_button_loading(false) {
                     set_status(&format!("failed: {:?}", err));
                 }
             });
@@ -1944,12 +2045,54 @@ mod web_app {
         )?;
         log_scale_callback.forget();
 
+        let drag_toggle_callback = Closure::wrap(Box::new(move || {
+            let next_enabled = DRAG_TOOL_ENABLED.with(|state| {
+                let mut enabled = state.borrow_mut();
+                *enabled = !*enabled;
+                *enabled
+            });
+            if next_enabled {
+                FIB_STATE.with(|state| {
+                    state.borrow_mut().enabled = false;
+                });
+                let _ = set_fib_preview_point(None);
+                if let Err(err) = sync_fib_button() {
+                    set_status(&format!("failed: {:?}", err));
+                    return;
+                }
+                set_status("Drag tool enabled");
+                set_fib_popup_info("Drag chart to pan X and Y axes.");
+            } else {
+                set_status("Drag tool disabled");
+                set_fib_popup_info("Move cursor over chart to use Fibonacci tool");
+            }
+            if let Err(err) = sync_drag_button() {
+                set_status(&format!("failed: {:?}", err));
+                return;
+            }
+        }) as Box<dyn FnMut()>);
+
+        drag_toggle_button.add_event_listener_with_callback(
+            "click",
+            drag_toggle_callback.as_ref().unchecked_ref(),
+        )?;
+        drag_toggle_callback.forget();
+
         let fib_toggle_callback = Closure::wrap(Box::new(move || {
             FIB_STATE.with(|state| {
                 let mut cfg = state.borrow_mut();
                 cfg.enabled = !cfg.enabled;
             });
             let fib_enabled = FIB_STATE.with(|state| state.borrow().enabled);
+            if fib_enabled {
+                DRAG_TOOL_ENABLED.with(|state| {
+                    *state.borrow_mut() = false;
+                });
+                if let Err(err) = sync_drag_button() {
+                    set_status(&format!("failed: {:?}", err));
+                    return;
+                }
+            }
             if !fib_enabled {
                 let _ = set_fib_preview_point(None);
             }
@@ -2124,10 +2267,12 @@ mod web_app {
             }
         }) as Box<dyn FnMut()>);
 
-        settings_side_toggle_button.add_event_listener_with_callback(
-            "click",
-            settings_side_toggle_callback.as_ref().unchecked_ref(),
-        )?;
+        if let Some(settings_side_toggle_button) = settings_side_toggle_button {
+            settings_side_toggle_button.add_event_listener_with_callback(
+                "click",
+                settings_side_toggle_callback.as_ref().unchecked_ref(),
+            )?;
+        }
         settings_side_toggle_callback.forget();
 
         let ma_drag_card = ma_settings_card.clone();
@@ -2218,10 +2363,13 @@ mod web_app {
             }
         }) as Box<dyn FnMut()>);
 
-        connection_settings_side_toggle_button.add_event_listener_with_callback(
-            "click",
-            connection_settings_side_toggle_callback.as_ref().unchecked_ref(),
-        )?;
+        if let Some(connection_settings_side_toggle_button) = connection_settings_side_toggle_button
+        {
+            connection_settings_side_toggle_button.add_event_listener_with_callback(
+                "click",
+                connection_settings_side_toggle_callback.as_ref().unchecked_ref(),
+            )?;
+        }
         connection_settings_side_toggle_callback.forget();
 
         let drag_card = connection_settings_card.clone();
@@ -2283,9 +2431,17 @@ mod web_app {
             FIB_POPUP_DRAG.with(|state| {
                 *state.borrow_mut() = None;
             });
+            CHART_DRAG.with(|state| {
+                *state.borrow_mut() = None;
+            });
             Y_STRETCH_DRAG.with(|state| {
                 *state.borrow_mut() = None;
             });
+            if DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
+                set_chart_cursor("move");
+            } else {
+                set_chart_cursor("default");
+            }
         }) as Box<dyn FnMut(MouseEvent)>);
 
         doc.add_event_listener_with_callback("mouseup", drag_end_callback.as_ref().unchecked_ref())?;
@@ -2295,22 +2451,19 @@ mod web_app {
         let mouse_move_callback = Closure::wrap(Box::new(move |event: MouseEvent| {
             show_fib_popup();
             let mut need_fib_redraw = false;
-            LAST_RENDERED_CANDLES.with(|state| {
-                let candles = state.borrow();
-                if candles.is_empty() {
-                    if set_fib_preview_point(None) {
-                        need_fib_redraw = true;
-                    }
-                    set_hover_info("Hover chart to see candle time");
-                    set_fib_popup_info("Load candles, then move cursor and click points for Fib.");
-                    hide_hover_tooltip();
-                    hide_cursor_time_label();
-                    hide_cursor_vline();
-                    hide_cursor_hline();
-                    hide_rsi_cursor_vline();
-                    return;
+            let candles = LAST_RENDERED_CANDLES.with(|state| state.borrow().clone());
+            if candles.is_empty() {
+                if set_fib_preview_point(None) {
+                    need_fib_redraw = true;
                 }
-
+                set_hover_info("Hover chart to see candle time");
+                set_fib_popup_info("Load candles, then move cursor and click points for Fib.");
+                hide_hover_tooltip();
+                hide_cursor_time_label();
+                hide_cursor_vline();
+                hide_cursor_hline();
+                hide_rsi_cursor_vline();
+            } else {
                 let canvas_width = move_canvas.client_width() as f64;
                 let canvas_height = move_canvas.client_height() as f64;
                 if canvas_width <= 0.0 || canvas_height <= 0.0 {
@@ -2376,20 +2529,58 @@ mod web_app {
                     return;
                 }
 
-                let mut is_y_stretch_mode = false;
-                Y_STRETCH_DRAG.with(|state| {
-                    let drag = *state.borrow();
-                    if let Some(drag) = drag {
-                        let dy = event.offset_y() - drag.start_y;
-                        let next_factor = drag.start_factor * (dy as f64 / 180.0).exp();
-                        if set_y_stretch_factor(next_factor) {
-                            if let Err(err) = redraw_visible_chart_only() {
-                                set_status(&format!("failed: {:?}", err));
-                            }
+                let chart_drag = CHART_DRAG.with(|state| *state.borrow());
+                let mut is_chart_drag_mode = false;
+                if let Some(drag) = chart_drag {
+                    let dx = event.offset_x() - drag.start_x;
+                    let dy = event.offset_y() - drag.start_y;
+                    let plot_width = (plot_right - plot_left).max(1.0);
+                    let plot_height = (plot_bottom - plot_top).max(1.0);
+                    let span_x = (drag.ts_end - drag.ts_start).max(60) as f64;
+                    let shift_seconds = (-(dx as f64) / plot_width * span_x).round() as i64;
+                    let next_y_offset = drag.y_offset_start + (dy as f64 / plot_height) * drag.y_span;
+                    let y_changed = if drag.use_log_scale {
+                        set_y_pan_log_offset(next_y_offset)
+                    } else {
+                        set_y_pan_linear_offset(next_y_offset)
+                    };
+                    if shift_seconds != 0 {
+                        if let Err(err) = apply_range_change_client_only(
+                            drag.ts_start + shift_seconds,
+                            drag.ts_end + shift_seconds,
+                        ) {
+                            set_status(&format!("failed: {:?}", err));
                         }
-                        is_y_stretch_mode = true;
+                    } else if y_changed {
+                        if let Err(err) = redraw_visible_chart_only() {
+                            set_status(&format!("failed: {:?}", err));
+                        }
                     }
-                });
+                    is_chart_drag_mode = true;
+                }
+
+                if is_chart_drag_mode {
+                    set_chart_cursor("grabbing");
+                    hide_hover_tooltip();
+                    hide_cursor_time_label();
+                    hide_cursor_vline();
+                    hide_cursor_hline();
+                    hide_rsi_cursor_vline();
+                    return;
+                }
+
+                let y_stretch_drag = Y_STRETCH_DRAG.with(|state| *state.borrow());
+                let mut is_y_stretch_mode = false;
+                if let Some(drag) = y_stretch_drag {
+                    let dy = event.offset_y() - drag.start_y;
+                    let next_factor = drag.start_factor * (dy as f64 / 180.0).exp();
+                    if set_y_stretch_factor(next_factor) {
+                        if let Err(err) = redraw_visible_chart_only() {
+                            set_status(&format!("failed: {:?}", err));
+                        }
+                    }
+                    is_y_stretch_mode = true;
+                }
 
                 if is_y_stretch_mode {
                     hide_hover_tooltip();
@@ -2471,7 +2662,7 @@ mod web_app {
                     canvas_top + plot_bottom,
                 );
                 show_rsi_cursor_vline(crosshair_x);
-            });
+            }
             if need_fib_redraw {
                 if let Err(err) = redraw_visible_chart_only() {
                     set_status(&format!("failed: {:?}", err));
@@ -2487,112 +2678,150 @@ mod web_app {
 
         let fib_canvas = chart_canvas.clone();
         let mouse_down_callback = Closure::wrap(Box::new(move |event: MouseEvent| {
-            LAST_RENDERED_CANDLES.with(|state| {
-                let candles = state.borrow();
-                if candles.is_empty() {
-                    return;
-                }
+            let candles = LAST_RENDERED_CANDLES.with(|state| state.borrow().clone());
+            if candles.is_empty() {
+                return;
+            }
 
-                if FIB_STATE.with(|fib| fib.borrow().enabled) && !event.shift_key() {
-                    let _ = set_fib_preview_point(None);
-                    let canvas_width = fib_canvas.client_width() as f64;
-                    let canvas_height = fib_canvas.client_height() as f64;
-                    let (plot_left, plot_right, plot_top, plot_bottom) =
-                        match plot_bounds(canvas_width, canvas_height) {
-                            Some(v) => v,
-                            None => return,
-                        };
-
-                    let crosshair_x = (event.offset_x() as f64).clamp(plot_left, plot_right);
-                    let crosshair_y = (event.offset_y() as f64).clamp(plot_top, plot_bottom);
-                    let cursor_ts = match timestamp_from_canvas_x(
-                        canvas_width,
-                        canvas_height,
-                        crosshair_x,
-                    ) {
+            if FIB_STATE.with(|fib| fib.borrow().enabled) && !event.shift_key() {
+                let _ = set_fib_preview_point(None);
+                let canvas_width = fib_canvas.client_width() as f64;
+                let canvas_height = fib_canvas.client_height() as f64;
+                let (plot_left, plot_right, plot_top, plot_bottom) =
+                    match plot_bounds(canvas_width, canvas_height) {
                         Some(v) => v,
                         None => return,
                     };
-                    let price = price_from_canvas_y(crosshair_y, plot_top, plot_bottom)
-                        .unwrap_or_else(|| candles.last().map(|c| c.close).unwrap_or(0.0));
 
-                    let (status_message, fib_completed) = FIB_STATE.with(|fib| {
-                        let mut cfg = fib.borrow_mut();
-                        if cfg.anchor_a.is_none() || cfg.anchor_b.is_some() {
-                            cfg.anchor_a = Some((cursor_ts, price));
-                            cfg.anchor_b = None;
-                            (
-                                format!(
-                                    "Fib first point set: {} @ {:.2}. Click second point",
-                                    unix_seconds_to_hover_text(cursor_ts),
-                                    price
-                                ),
-                                false,
-                            )
-                        } else {
-                            cfg.anchor_b = Some((cursor_ts, price));
-                            cfg.enabled = false;
-                            let (anchor_ts, anchor_price) = cfg.anchor_a.unwrap();
-                            (
-                                format!(
-                                    "Fib ready: {} @ {:.2} -> {} @ {:.2}",
-                                    unix_seconds_to_hover_text(anchor_ts),
-                                    anchor_price,
-                                    unix_seconds_to_hover_text(cursor_ts),
-                                    price
-                                ),
-                                true,
-                            )
-                        }
-                    });
+                let crosshair_x = (event.offset_x() as f64).clamp(plot_left, plot_right);
+                let crosshair_y = (event.offset_y() as f64).clamp(plot_top, plot_bottom);
+                let cursor_ts = match timestamp_from_canvas_x(canvas_width, canvas_height, crosshair_x)
+                {
+                    Some(v) => v,
+                    None => return,
+                };
+                let price = price_from_canvas_y(crosshair_y, plot_top, plot_bottom)
+                    .unwrap_or_else(|| candles.last().map(|c| c.close).unwrap_or(0.0));
 
-                    if fib_completed {
-                        if let Err(err) = sync_fib_button() {
-                            set_status(&format!("failed: {:?}", err));
-                            return;
-                        }
+                let (status_message, fib_completed) = FIB_STATE.with(|fib| {
+                    let mut cfg = fib.borrow_mut();
+                    if cfg.anchor_a.is_none() || cfg.anchor_b.is_some() {
+                        cfg.anchor_a = Some((cursor_ts, price));
+                        cfg.anchor_b = None;
+                        (
+                            format!(
+                                "Fib first point set: {} @ {:.2}. Click second point",
+                                unix_seconds_to_hover_text(cursor_ts),
+                                price
+                            ),
+                            false,
+                        )
+                    } else {
+                        cfg.anchor_b = Some((cursor_ts, price));
+                        cfg.enabled = false;
+                        let (anchor_ts, anchor_price) = cfg.anchor_a.unwrap();
+                        (
+                            format!(
+                                "Fib ready: {} @ {:.2} -> {} @ {:.2}",
+                                unix_seconds_to_hover_text(anchor_ts),
+                                anchor_price,
+                                unix_seconds_to_hover_text(cursor_ts),
+                                price
+                            ),
+                            true,
+                        )
                     }
-                    set_status(&status_message);
-                    set_fib_popup_info(&status_message);
-                    spawn_local(async {
-                        if let Err(err) = rerender_cached_or_fetch().await {
-                            set_status(&format!("failed: {:?}", err));
-                        }
-                    });
-                    return;
-                }
+                });
 
-                if event.shift_key() {
-                    DRAG_PAN_REMAINDER.with(|state| {
-                        *state.borrow_mut() = 0.0;
-                    });
-                    PAN_LAST_X.with(|pan| {
-                        *pan.borrow_mut() = Some(event.offset_x());
+                if fib_completed {
+                    if let Err(err) = sync_fib_button() {
+                        set_status(&format!("failed: {:?}", err));
+                        return;
+                    }
+                }
+                set_status(&status_message);
+                set_fib_popup_info(&status_message);
+                spawn_local(async {
+                    if let Err(err) = rerender_cached_or_fetch().await {
+                        set_status(&format!("failed: {:?}", err));
+                    }
+                });
+                return;
+            }
+
+            if event.shift_key() {
+                DRAG_PAN_REMAINDER.with(|state| {
+                    *state.borrow_mut() = 0.0;
+                });
+                PAN_LAST_X.with(|pan| {
+                    *pan.borrow_mut() = Some(event.offset_x());
+                });
+                set_chart_cursor("grabbing");
+                set_status("Pan mode: move mouse left/right");
+            } else if DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
+                let canvas_width = fib_canvas.client_width() as f64;
+                let canvas_height = fib_canvas.client_height() as f64;
+                let (plot_left, plot_right, plot_top, plot_bottom) =
+                    match plot_bounds(canvas_width, canvas_height) {
+                        Some(v) => v,
+                        None => return,
+                    };
+                let offset_x = event.offset_x() as f64;
+                let offset_y = event.offset_y() as f64;
+                if offset_x >= plot_left
+                    && offset_x <= plot_right
+                    && offset_y >= plot_top
+                    && offset_y <= plot_bottom
+                {
+                    let Some((ts_start, ts_end)) = rendered_range() else {
+                        return;
+                    };
+                    let Some(view) = CHART_VIEW.with(|state| *state.borrow()) else {
+                        return;
+                    };
+                    let (y_offset_start, y_span) = if view.use_log_scale {
+                        let span = (view.y_high.ln() - view.y_low.ln()).max(0.000_1);
+                        let offset = Y_PAN_LOG_OFFSET.with(|state| *state.borrow());
+                        (offset, span)
+                    } else {
+                        let span = (view.y_high - view.y_low).abs().max(0.01);
+                        let offset = Y_PAN_LINEAR_OFFSET.with(|state| *state.borrow());
+                        (offset, span)
+                    };
+                    CHART_DRAG.with(|state| {
+                        *state.borrow_mut() = Some(ChartDragState {
+                            start_x: event.offset_x(),
+                            start_y: event.offset_y(),
+                            ts_start,
+                            ts_end,
+                            y_offset_start,
+                            y_span,
+                            use_log_scale: view.use_log_scale,
+                        });
                     });
                     set_chart_cursor("grabbing");
-                    set_status("Pan mode: move mouse left/right");
-                } else {
-                    let canvas_width = fib_canvas.client_width() as f64;
-                    let canvas_height = fib_canvas.client_height() as f64;
-                    let (_, _, plot_top, plot_bottom) = match plot_bounds(canvas_width, canvas_height)
-                    {
-                        Some(v) => v,
-                        None => return,
-                    };
-                    let offset_y = event.offset_y() as f64;
-                    if offset_y >= plot_top && offset_y <= plot_bottom {
-                        let start_factor = Y_STRETCH_FACTOR.with(|state| *state.borrow());
-                        Y_STRETCH_DRAG.with(|state| {
-                            *state.borrow_mut() = Some(YStretchDrag {
-                                start_y: event.offset_y(),
-                                start_factor,
-                            });
-                        });
-                        set_chart_cursor("ns-resize");
-                        set_status("Y stretch: drag up or down");
-                    }
+                    set_status("Drag tool: pan X and Y");
                 }
-            });
+            } else {
+                let canvas_width = fib_canvas.client_width() as f64;
+                let canvas_height = fib_canvas.client_height() as f64;
+                let (_, _, plot_top, plot_bottom) = match plot_bounds(canvas_width, canvas_height) {
+                    Some(v) => v,
+                    None => return,
+                };
+                let offset_y = event.offset_y() as f64;
+                if offset_y >= plot_top && offset_y <= plot_bottom {
+                    let start_factor = Y_STRETCH_FACTOR.with(|state| *state.borrow());
+                    Y_STRETCH_DRAG.with(|state| {
+                        *state.borrow_mut() = Some(YStretchDrag {
+                            start_y: event.offset_y(),
+                            start_factor,
+                        });
+                    });
+                    set_chart_cursor("ns-resize");
+                    set_status("Y stretch: drag up or down");
+                }
+            }
         }) as Box<dyn FnMut(MouseEvent)>);
 
         chart_canvas.add_event_listener_with_callback(
@@ -2610,12 +2839,18 @@ mod web_app {
                 DRAG_PAN_REMAINDER.with(|state| {
                     *state.borrow_mut() = 0.0;
                 });
-                set_chart_cursor("default");
             }
+            CHART_DRAG.with(|state| {
+                *state.borrow_mut() = None;
+            });
             Y_STRETCH_DRAG.with(|state| {
                 *state.borrow_mut() = None;
             });
-            set_chart_cursor("default");
+            if DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
+                set_chart_cursor("move");
+            } else {
+                set_chart_cursor("default");
+            }
         }) as Box<dyn FnMut(MouseEvent)>);
 
         chart_canvas.add_event_listener_with_callback(
@@ -2631,6 +2866,9 @@ mod web_app {
             });
             DRAG_PAN_REMAINDER.with(|state| {
                 *state.borrow_mut() = 0.0;
+            });
+            CHART_DRAG.with(|state| {
+                *state.borrow_mut() = None;
             });
             Y_STRETCH_DRAG.with(|state| {
                 *state.borrow_mut() = None;

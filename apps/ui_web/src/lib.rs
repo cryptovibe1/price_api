@@ -35,12 +35,14 @@ mod web_app {
         static WHEEL_PAN_REMAINDER: RefCell<f64> = const { RefCell::new(0.0) };
         static DRAG_TOOL_ENABLED: RefCell<bool> = const { RefCell::new(false) };
         static CHART_DRAG: RefCell<Option<ChartDragState>> = const { RefCell::new(None) };
+        static MEASURE_STATE: RefCell<MeasureState> = const { RefCell::new(MeasureState::new()) };
         static Y_STRETCH_FACTOR: RefCell<f64> = const { RefCell::new(1.0) };
         static Y_PAN_LINEAR_OFFSET: RefCell<f64> = const { RefCell::new(0.0) };
         static Y_PAN_LOG_OFFSET: RefCell<f64> = const { RefCell::new(0.0) };
         static Y_STRETCH_DRAG: RefCell<Option<YStretchDrag>> = const { RefCell::new(None) };
         static FIB_STATE: RefCell<FibState> = const { RefCell::new(FibState::new()) };
         static FIB_PREVIEW_POINT: RefCell<Option<(i64, f64)>> = const { RefCell::new(None) };
+        static MEASURE_DRAG_TS: RefCell<Option<i64>> = const { RefCell::new(None) };
         static FIB_POPUP_DRAG: RefCell<Option<(f64, f64)>> = const { RefCell::new(None) };
         static MA_SETTINGS_DRAG: RefCell<Option<(f64, f64)>> = const { RefCell::new(None) };
         static CONNECTION_SETTINGS_DRAG: RefCell<Option<(f64, f64)>> = const { RefCell::new(None) };
@@ -92,6 +94,23 @@ mod web_app {
         y_offset_start: f64,
         y_span: f64,
         use_log_scale: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    struct MeasureState {
+        enabled: bool,
+        anchor_a: Option<i64>,
+        anchor_b: Option<i64>,
+    }
+
+    impl MeasureState {
+        const fn new() -> Self {
+            Self {
+                enabled: false,
+                anchor_a: None,
+                anchor_b: None,
+            }
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -248,6 +267,28 @@ mod web_app {
         Ok(())
     }
 
+    fn sync_measure_button() -> Result<(), JsValue> {
+        let doc = document()?;
+        let button = doc
+            .get_element_by_id("measure-toggle")
+            .ok_or_else(|| JsValue::from_str("missing measure toggle button"))?;
+
+        let enabled = MEASURE_STATE.with(|state| state.borrow().enabled);
+        if enabled {
+            button.set_class_name("toggle-btn active");
+            button.set_attribute("aria-pressed", "true")?;
+            button.set_attribute("aria-label", "Measure On")?;
+            button.set_attribute("title", "Measure On")?;
+        } else {
+            button.set_class_name("toggle-btn");
+            button.set_attribute("aria-pressed", "false")?;
+            button.set_attribute("aria-label", "Measure Off")?;
+            button.set_attribute("title", "Measure Off")?;
+        }
+
+        Ok(())
+    }
+
     fn set_load_button_loading(loading: bool) -> Result<(), JsValue> {
         let doc = document()?;
         let button = doc
@@ -289,6 +330,19 @@ mod web_app {
         })
     }
 
+    fn active_measure_range() -> Option<(i64, i64)> {
+        MEASURE_STATE.with(|state| {
+            let cfg = *state.borrow();
+            let start = cfg.anchor_a?;
+            let end = match (cfg.anchor_b, cfg.enabled) {
+                (Some(v), _) => v,
+                (None, true) => MEASURE_DRAG_TS.with(|drag| *drag.borrow())?,
+                (None, false) => return None,
+            };
+            Some((start.min(end), start.max(end)))
+        })
+    }
+
     fn set_fib_preview_point(next: Option<(i64, f64)>) -> bool {
         FIB_PREVIEW_POINT.with(|state| {
             let mut cur = state.borrow_mut();
@@ -319,6 +373,30 @@ mod web_app {
     fn fib_ratio_label(ratio: f64) -> String {
         let text = format!("{ratio:.3}");
         text.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+
+    fn format_duration_human(seconds: i64) -> String {
+        let mut remaining = seconds.abs().max(1);
+        let units = [
+            ("days", 86_400_i64),
+            ("hours", 3_600_i64),
+            ("min", 60_i64),
+            ("sec", 1_i64),
+        ];
+        let mut parts = Vec::new();
+        for (label, size) in units {
+            if remaining >= size || (size == 1 && parts.is_empty()) {
+                let value = remaining / size;
+                remaining %= size;
+                if value > 0 {
+                    parts.push(format!("{value}{label}"));
+                }
+            }
+            if parts.len() == 2 {
+                break;
+            }
+        }
+        parts.join(" ")
     }
 
     fn visible_fib_levels(
@@ -1532,6 +1610,7 @@ mod web_app {
             return Ok(());
         };
         let fib_overlay = active_fib_overlay();
+        let measure_range = active_measure_range();
 
         // Keep autoscaling tied to market data so Fib extensions don't flatten the chart.
         let y_min_linear = raw_y_min;
@@ -1590,6 +1669,15 @@ mod web_app {
                 (start.min(end), start.max(end), label_x.min(x_end))
             })
             .unwrap_or((x_start, x_end, x_start));
+        let (measure_x_start, measure_x_end, measure_label_x) = measure_range
+            .map(|(start, end)| {
+                let start = start.clamp(x_start, x_end);
+                let end = end.clamp(x_start, x_end);
+                let label_x = start + ((end - start).max(60) / 2);
+                (start.min(end), start.max(end), label_x.clamp(x_start, x_end))
+            })
+            .unwrap_or((x_start, x_start, x_start));
+        let measure_label = measure_range.map(|(start, end)| format_duration_human(end - start));
 
         if use_log_scale {
             let mut chart = ChartBuilder::on(&root)
@@ -1664,6 +1752,39 @@ mod web_app {
                     )))
                     .map_err(|e| JsValue::from_str(&format!("fib label draw error: {e}")))?;
             }
+
+            if let Some(label) = &measure_label {
+                let measure_y = if y_low > 0.0 && y_high > y_low {
+                    (y_low.ln() + (y_high.ln() - y_low.ln()) * 0.92).exp()
+                } else {
+                    y_high
+                };
+                chart
+                    .draw_series([
+                        PathElement::new(
+                            vec![(measure_x_start, y_low), (measure_x_start, y_high)],
+                            RGBColor(42, 54, 80).mix(0.35),
+                        ),
+                        PathElement::new(
+                            vec![(measure_x_end, y_low), (measure_x_end, y_high)],
+                            RGBColor(42, 54, 80).mix(0.35),
+                        ),
+                    ])
+                    .map_err(|e| JsValue::from_str(&format!("measure boundary draw error: {e}")))?;
+                chart
+                    .draw_series(LineSeries::new(
+                        vec![(measure_x_start, measure_y), (measure_x_end, measure_y)],
+                        &RGBColor(42, 54, 80),
+                    ))
+                    .map_err(|e| JsValue::from_str(&format!("measure draw error: {e}")))?;
+                chart
+                    .draw_series(std::iter::once(Text::new(
+                        label.clone(),
+                        (measure_label_x, measure_y),
+                        ("sans-serif", 12).into_font().color(&RGBColor(42, 54, 80)),
+                    )))
+                    .map_err(|e| JsValue::from_str(&format!("measure label draw error: {e}")))?;
+            }
         } else {
             let mut chart = ChartBuilder::on(&root)
                 .margin(16)
@@ -1737,6 +1858,35 @@ mod web_app {
                     )))
                     .map_err(|e| JsValue::from_str(&format!("fib label draw error: {e}")))?;
             }
+
+            if let Some(label) = &measure_label {
+                let measure_y = y_low + (y_high - y_low) * 0.92;
+                chart
+                    .draw_series([
+                        PathElement::new(
+                            vec![(measure_x_start, y_low), (measure_x_start, y_high)],
+                            RGBColor(42, 54, 80).mix(0.35),
+                        ),
+                        PathElement::new(
+                            vec![(measure_x_end, y_low), (measure_x_end, y_high)],
+                            RGBColor(42, 54, 80).mix(0.35),
+                        ),
+                    ])
+                    .map_err(|e| JsValue::from_str(&format!("measure boundary draw error: {e}")))?;
+                chart
+                    .draw_series(LineSeries::new(
+                        vec![(measure_x_start, measure_y), (measure_x_end, measure_y)],
+                        &RGBColor(42, 54, 80),
+                    ))
+                    .map_err(|e| JsValue::from_str(&format!("measure draw error: {e}")))?;
+                chart
+                    .draw_series(std::iter::once(Text::new(
+                        label.clone(),
+                        (measure_label_x, measure_y),
+                        ("sans-serif", 12).into_font().color(&RGBColor(42, 54, 80)),
+                    )))
+                    .map_err(|e| JsValue::from_str(&format!("measure label draw error: {e}")))?;
+            }
         }
 
         root.present()
@@ -1756,7 +1906,10 @@ mod web_app {
     ) {
         let first_ts = candles.first().map(|c| c.timestamp).unwrap_or_default();
         let last_ts = candles.last().map(|c| c.timestamp).unwrap_or_default();
+        let first_text = unix_seconds_to_hover_text(first_ts);
+        let last_text = unix_seconds_to_hover_text(last_ts);
         let total_volume: f64 = candles.iter().map(|c| c.volume).sum();
+        let period_label = input_value("period").unwrap_or_else(|_| "unknown".to_string());
         let scale_label = if log_scale { "log" } else { "linear" };
         let active: Vec<String> = ma_configs
             .iter()
@@ -1771,10 +1924,11 @@ mod web_app {
 
         if let (Some(request_ms), Some(total_ms)) = (request_ms, total_ms) {
             set_status(&format!(
-                "Loaded {} candles from {} to {} | total volume {:.4} | scale {} | {} | request {:.0}ms | total {:.0}ms",
+                "Loaded {} candles from {} to {} | period {} | total volume {:.4} | scale {} | {} | request {:.0}ms | total {:.0}ms",
                 candles.len(),
-                first_ts,
-                last_ts,
+                first_text,
+                last_text,
+                period_label,
                 total_volume,
                 scale_label,
                 ma_label,
@@ -1783,10 +1937,11 @@ mod web_app {
             ));
         } else {
             set_status(&format!(
-                "Loaded {} candles from {} to {} | total volume {:.4} | scale {} | {} | rerender client-side",
+                "Loaded {} candles from {} to {} | period {} | total volume {:.4} | scale {} | {} | rerender client-side",
                 candles.len(),
-                first_ts,
-                last_ts,
+                first_text,
+                last_text,
+                period_label,
                 total_volume,
                 scale_label,
                 ma_label
@@ -1874,6 +2029,7 @@ mod web_app {
         load_saved_inputs()?;
         sync_fib_button()?;
         sync_drag_button()?;
+        sync_measure_button()?;
         set_fib_popup_info("Move cursor over chart to use Fibonacci tool");
 
         let now_secs = (Date::now() / 1000.0) as i64;
@@ -1900,6 +2056,9 @@ mod web_app {
         let drag_toggle_button = doc
             .get_element_by_id("drag-toggle")
             .ok_or_else(|| JsValue::from_str("missing drag toggle button"))?;
+        let measure_toggle_button = doc
+            .get_element_by_id("measure-toggle")
+            .ok_or_else(|| JsValue::from_str("missing measure toggle button"))?;
         let fib_toggle_button = doc
             .get_element_by_id("fib-toggle")
             .ok_or_else(|| JsValue::from_str("missing fib toggle button"))?;
@@ -2055,8 +2214,21 @@ mod web_app {
                 FIB_STATE.with(|state| {
                     state.borrow_mut().enabled = false;
                 });
+                MEASURE_STATE.with(|state| {
+                    let mut cfg = state.borrow_mut();
+                    cfg.enabled = false;
+                    cfg.anchor_a = None;
+                    cfg.anchor_b = None;
+                });
+                MEASURE_DRAG_TS.with(|state| {
+                    *state.borrow_mut() = None;
+                });
                 let _ = set_fib_preview_point(None);
                 if let Err(err) = sync_fib_button() {
+                    set_status(&format!("failed: {:?}", err));
+                    return;
+                }
+                if let Err(err) = sync_measure_button() {
                     set_status(&format!("failed: {:?}", err));
                     return;
                 }
@@ -2078,6 +2250,55 @@ mod web_app {
         )?;
         drag_toggle_callback.forget();
 
+        let measure_toggle_callback = Closure::wrap(Box::new(move || {
+            let next_enabled = MEASURE_STATE.with(|state| {
+                let mut cfg = state.borrow_mut();
+                cfg.enabled = !cfg.enabled;
+                if cfg.enabled {
+                    cfg.anchor_a = None;
+                    cfg.anchor_b = None;
+                }
+                cfg.enabled
+            });
+            MEASURE_DRAG_TS.with(|state| {
+                *state.borrow_mut() = None;
+            });
+            if next_enabled {
+                FIB_STATE.with(|state| {
+                    state.borrow_mut().enabled = false;
+                });
+                DRAG_TOOL_ENABLED.with(|state| {
+                    *state.borrow_mut() = false;
+                });
+                let _ = set_fib_preview_point(None);
+                if let Err(err) = sync_fib_button() {
+                    set_status(&format!("failed: {:?}", err));
+                    return;
+                }
+                if let Err(err) = sync_drag_button() {
+                    set_status(&format!("failed: {:?}", err));
+                    return;
+                }
+                set_status("Measure tool enabled");
+                set_hover_info("Measure: click A on chart, drag to B on X-axis");
+            } else {
+                set_status("Measure tool disabled");
+            }
+            if let Err(err) = sync_measure_button() {
+                set_status(&format!("failed: {:?}", err));
+                return;
+            }
+            if let Err(err) = redraw_visible_chart_only() {
+                set_status(&format!("failed: {:?}", err));
+            }
+        }) as Box<dyn FnMut()>);
+
+        measure_toggle_button.add_event_listener_with_callback(
+            "click",
+            measure_toggle_callback.as_ref().unchecked_ref(),
+        )?;
+        measure_toggle_callback.forget();
+
         let fib_toggle_callback = Closure::wrap(Box::new(move || {
             FIB_STATE.with(|state| {
                 let mut cfg = state.borrow_mut();
@@ -2088,7 +2309,20 @@ mod web_app {
                 DRAG_TOOL_ENABLED.with(|state| {
                     *state.borrow_mut() = false;
                 });
+                MEASURE_STATE.with(|state| {
+                    let mut cfg = state.borrow_mut();
+                    cfg.enabled = false;
+                    cfg.anchor_a = None;
+                    cfg.anchor_b = None;
+                });
+                MEASURE_DRAG_TS.with(|state| {
+                    *state.borrow_mut() = None;
+                });
                 if let Err(err) = sync_drag_button() {
+                    set_status(&format!("failed: {:?}", err));
+                    return;
+                }
+                if let Err(err) = sync_measure_button() {
                     set_status(&format!("failed: {:?}", err));
                     return;
                 }
@@ -2529,6 +2763,45 @@ mod web_app {
                     return;
                 }
 
+                let measure_enabled = MEASURE_STATE.with(|state| state.borrow().enabled);
+                let measure_anchor_a = MEASURE_STATE.with(|state| state.borrow().anchor_a);
+                if measure_enabled && measure_anchor_a.is_some() {
+                    if let Some(cursor_ts) =
+                        timestamp_from_canvas_x(canvas_width, canvas_height, crosshair_x as f64)
+                    {
+                        let changed = MEASURE_DRAG_TS.with(|state| {
+                            let mut drag_ts = state.borrow_mut();
+                            if *drag_ts == Some(cursor_ts) {
+                                false
+                            } else {
+                                *drag_ts = Some(cursor_ts);
+                                true
+                            }
+                        });
+                        if changed {
+                            if let Err(err) = redraw_visible_chart_only() {
+                                set_status(&format!("failed: {:?}", err));
+                            }
+                        }
+                        if let Some(start_ts) = measure_anchor_a {
+                            let label = format_duration_human(cursor_ts - start_ts);
+                            set_status(&format!(
+                                "Measure: {} -> {} ({})",
+                                unix_seconds_to_hover_text(start_ts),
+                                unix_seconds_to_hover_text(cursor_ts),
+                                label
+                            ));
+                            set_hover_info(&format!("Measure period: {label}"));
+                        }
+                    }
+                    hide_hover_tooltip();
+                    hide_cursor_time_label();
+                    hide_cursor_vline();
+                    hide_cursor_hline();
+                    hide_rsi_cursor_vline();
+                    return;
+                }
+
                 let chart_drag = CHART_DRAG.with(|state| *state.borrow());
                 let mut is_chart_drag_mode = false;
                 if let Some(drag) = chart_drag {
@@ -2680,6 +2953,37 @@ mod web_app {
         let mouse_down_callback = Closure::wrap(Box::new(move |event: MouseEvent| {
             let candles = LAST_RENDERED_CANDLES.with(|state| state.borrow().clone());
             if candles.is_empty() {
+                return;
+            }
+
+            if MEASURE_STATE.with(|state| state.borrow().enabled) && !event.shift_key() {
+                let canvas_width = fib_canvas.client_width() as f64;
+                let canvas_height = fib_canvas.client_height() as f64;
+                let (plot_left, plot_right, _, _) = match plot_bounds(canvas_width, canvas_height) {
+                    Some(v) => v,
+                    None => return,
+                };
+                let crosshair_x = (event.offset_x() as f64).clamp(plot_left, plot_right);
+                let cursor_ts = match timestamp_from_canvas_x(canvas_width, canvas_height, crosshair_x)
+                {
+                    Some(v) => v,
+                    None => return,
+                };
+                MEASURE_STATE.with(|state| {
+                    let mut cfg = state.borrow_mut();
+                    cfg.anchor_a = Some(cursor_ts);
+                    cfg.anchor_b = None;
+                });
+                MEASURE_DRAG_TS.with(|state| {
+                    *state.borrow_mut() = Some(cursor_ts);
+                });
+                set_status(&format!(
+                    "Measure start: {}. Drag to end point.",
+                    unix_seconds_to_hover_text(cursor_ts)
+                ));
+                if let Err(err) = redraw_visible_chart_only() {
+                    set_status(&format!("failed: {:?}", err));
+                }
                 return;
             }
 
@@ -2846,6 +3150,33 @@ mod web_app {
             Y_STRETCH_DRAG.with(|state| {
                 *state.borrow_mut() = None;
             });
+            let measure_finished = MEASURE_STATE.with(|state| {
+                let mut cfg = state.borrow_mut();
+                if cfg.enabled {
+                    if let Some(end_ts) = MEASURE_DRAG_TS.with(|drag| *drag.borrow()) {
+                        if let Some(start_ts) = cfg.anchor_a {
+                            cfg.anchor_b = Some(end_ts);
+                            cfg.enabled = false;
+                            return Some((start_ts, end_ts));
+                        }
+                    }
+                }
+                None
+            });
+            if let Some((start_ts, end_ts)) = measure_finished {
+                if let Err(err) = sync_measure_button() {
+                    set_status(&format!("failed: {:?}", err));
+                    return;
+                }
+                let label = format_duration_human(end_ts - start_ts);
+                set_status(&format!(
+                    "Measured: {} -> {} ({})",
+                    unix_seconds_to_hover_text(start_ts),
+                    unix_seconds_to_hover_text(end_ts),
+                    label
+                ));
+                set_hover_info(&format!("Measure period: {label}"));
+            }
             if DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
                 set_chart_cursor("move");
             } else {

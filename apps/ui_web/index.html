@@ -351,6 +351,32 @@
         stroke-linejoin: round;
       }
 
+      #measure-toggle {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 8px;
+        background: #ffffff;
+        color: var(--text);
+        border: 1px solid var(--line);
+      }
+
+      #measure-toggle.active {
+        background: linear-gradient(180deg, #3e8ce6, #2f7dd8);
+        color: #ffffff;
+        border-color: transparent;
+      }
+
+      #measure-toggle svg {
+        width: 18px;
+        height: 18px;
+        stroke: currentColor;
+        fill: none;
+        stroke-width: 1.8;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
       .controls #load {
         margin-top: 20px;
         display: inline-flex;
@@ -716,6 +742,27 @@
                 <path d="m3 12 3 3" />
                 <path d="m21 12-3-3" />
                 <path d="m21 12-3 3" />
+              </svg>
+            </button>
+          </div>
+          <div>
+            <label for="measure-toggle">Measure</label>
+            <button
+              id="measure-toggle"
+              class="toggle-btn"
+              type="button"
+              aria-label="Measure Off"
+              title="Measure Off"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 18h16" />
+                <path d="M7 18V9" />
+                <path d="M17 18V6" />
+                <path d="M7 12h10" />
+                <path d="m7 12 2-2" />
+                <path d="m7 12 2 2" />
+                <path d="m17 12-2-2" />
+                <path d="m17 12-2 2" />
               </svg>
             </button>
           </div>

@@ -18,6 +18,13 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CandleUpdateEvent {
+    pub db: String,
+    pub latest_timestamp: i64,
+    pub inserted: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum Unit {
     Minute,

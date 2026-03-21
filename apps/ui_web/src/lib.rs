@@ -12,8 +12,8 @@ mod web_app {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::spawn_local;
     use web_sys::{
-        Document, HtmlCanvasElement, HtmlElement, HtmlInputElement, HtmlSelectElement,
-        KeyboardEvent, MouseEvent, Storage, WheelEvent,
+        Document, Event, HtmlCanvasElement, HtmlElement, HtmlInputElement, HtmlSelectElement,
+        KeyboardEvent, MessageEvent, MouseEvent, Storage, WebSocket, WheelEvent,
     };
 
     #[derive(Debug, Clone, Deserialize)]
@@ -26,9 +26,15 @@ mod web_app {
         volume: f64,
     }
 
+    #[derive(Debug, Clone, Deserialize)]
+    struct RealtimeUpdateEvent {
+        db: String,
+    }
+
     thread_local! {
         static LAST_CANDLES: RefCell<Vec<Candle>> = const { RefCell::new(Vec::new()) };
         static LAST_RENDERED_CANDLES: RefCell<Vec<Candle>> = const { RefCell::new(Vec::new()) };
+        static LIVE_WS: RefCell<Option<LiveWsConnection>> = const { RefCell::new(None) };
         static CLIENT_VIEW_RANGE: RefCell<Option<(i64, i64)>> = const { RefCell::new(None) };
         static PAN_LAST_X: RefCell<Option<i32>> = const { RefCell::new(None) };
         static DRAG_PAN_REMAINDER: RefCell<f64> = const { RefCell::new(0.0) };
@@ -83,6 +89,14 @@ mod web_app {
     struct YStretchDrag {
         start_y: i32,
         start_factor: f64,
+    }
+
+    struct LiveWsConnection {
+        ws: WebSocket,
+        _onopen: Closure<dyn FnMut(Event)>,
+        _onmessage: Closure<dyn FnMut(MessageEvent)>,
+        _onerror: Closure<dyn FnMut(Event)>,
+        _onclose: Closure<dyn FnMut(Event)>,
     }
 
     #[derive(Clone, Copy)]
@@ -325,7 +339,10 @@ mod web_app {
             Some(FibOverlay {
                 x_start: ts_a.min(ts_b),
                 x_end: ts_a.max(ts_b),
-                levels: ratios.into_iter().map(|r| (r, price_b - delta * r)).collect(),
+                levels: ratios
+                    .into_iter()
+                    .map(|r| (r, price_b - delta * r))
+                    .collect(),
             })
         })
     }
@@ -603,17 +620,18 @@ mod web_app {
 
             if let Some(node) = doc.get_element_by_id("rsi-cursor-vline") {
                 if let Ok(el) = node.dyn_into::<HtmlElement>() {
-                    let main_ratio =
-                        (((x as f64).clamp(main_plot_left, main_plot_right) - main_plot_left)
-                            / (main_plot_right - main_plot_left))
-                            .clamp(0.0, 1.0);
+                    let main_ratio = (((x as f64).clamp(main_plot_left, main_plot_right)
+                        - main_plot_left)
+                        / (main_plot_right - main_plot_left))
+                        .clamp(0.0, 1.0);
                     let mapped_x = plot_left + main_ratio * (plot_right - plot_left);
                     let clamped_x = (rsi_canvas_left + mapped_x).round() as i32;
                     let _ = el.style().set_property("display", "block");
                     let _ = el.style().set_property("left", &format!("{}px", clamped_x));
-                    let _ = el
-                        .style()
-                        .set_property("top", &format!("{}px", (rsi_canvas_top + plot_top).round() as i32));
+                    let _ = el.style().set_property(
+                        "top",
+                        &format!("{}px", (rsi_canvas_top + plot_top).round() as i32),
+                    );
                     let _ = el.style().set_property(
                         "height",
                         &format!("{}px", (plot_bottom - plot_top).max(0.0).round() as i32),
@@ -703,7 +721,10 @@ mod web_app {
             toggle.set_text_content(Some("Show"));
         }
 
-        storage()?.set_item(STORAGE_KEY_SETTINGS_VISIBLE, if visible { "1" } else { "0" })?;
+        storage()?.set_item(
+            STORAGE_KEY_SETTINGS_VISIBLE,
+            if visible { "1" } else { "0" },
+        )?;
         Ok(())
     }
 
@@ -869,7 +890,11 @@ mod web_app {
         storage.set_item(STORAGE_KEY_TS_END, &input_value("ts-end-human")?)?;
         storage.set_item(
             STORAGE_KEY_LOG_SCALE,
-            if checkbox_checked("log-scale")? { "1" } else { "0" },
+            if checkbox_checked("log-scale")? {
+                "1"
+            } else {
+                "0"
+            },
         )?;
         for idx in 1..=MA_COUNT {
             let enabled_key = format!("price_api.ma{idx}.enabled");
@@ -1010,6 +1035,89 @@ mod web_app {
         Ok(format!(
             "{base}/candles/{db}/btc/usd?period={period}&ts_start={ts_start}&ts_end={ts_end}"
         ))
+    }
+
+    fn build_websocket_url(db: &str) -> Result<String, JsValue> {
+        let api_base = input_value("api-base")?;
+        let base = api_base.trim().trim_end_matches('/');
+        if base.is_empty() {
+            return Err(JsValue::from_str("api-base is empty"));
+        }
+
+        let ws_base = if let Some(rest) = base.strip_prefix("https://") {
+            format!("wss://{rest}")
+        } else if let Some(rest) = base.strip_prefix("http://") {
+            format!("ws://{rest}")
+        } else if base.starts_with("wss://") || base.starts_with("ws://") {
+            base.to_string()
+        } else {
+            return Err(JsValue::from_str(
+                "api-base must start with http:// or https://",
+            ));
+        };
+
+        Ok(format!("{ws_base}/ws/{db}"))
+    }
+
+    fn disconnect_realtime_ws() {
+        LIVE_WS.with(|state| {
+            if let Some(conn) = state.borrow_mut().take() {
+                conn.ws.set_onopen(None);
+                conn.ws.set_onmessage(None);
+                conn.ws.set_onerror(None);
+                conn.ws.set_onclose(None);
+                let _ = conn.ws.close();
+            }
+        });
+    }
+
+    fn connect_realtime_ws() -> Result<(), JsValue> {
+        disconnect_realtime_ws();
+
+        let db = select_value("db")?;
+        let url = build_websocket_url(&db)?;
+        let ws = WebSocket::new(&url)?;
+
+        let subscribed_db = db.clone();
+        let onopen = Closure::wrap(Box::new(move |_event: Event| {}) as Box<dyn FnMut(Event)>);
+        let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
+            let Some(text) = event.data().as_string() else {
+                return;
+            };
+            let Ok(update) = serde_json::from_str::<RealtimeUpdateEvent>(&text) else {
+                return;
+            };
+            if update.db != subscribed_db {
+                return;
+            }
+            if select_value("db").ok().as_deref() != Some(subscribed_db.as_str()) {
+                return;
+            }
+            spawn_local(async {
+                if let Err(err) = rerender_cached_or_fetch().await {
+                    set_status(&format!("failed: {:?}", err));
+                }
+            });
+        }) as Box<dyn FnMut(MessageEvent)>);
+        let onerror = Closure::wrap(Box::new(move |_event: Event| {}) as Box<dyn FnMut(Event)>);
+        let onclose = Closure::wrap(Box::new(move |_event: Event| {}) as Box<dyn FnMut(Event)>);
+
+        ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
+        ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+        ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+        ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
+
+        LIVE_WS.with(|state| {
+            *state.borrow_mut() = Some(LiveWsConnection {
+                ws,
+                _onopen: onopen,
+                _onmessage: onmessage,
+                _onerror: onerror,
+                _onclose: onclose,
+            });
+        });
+
+        Ok(())
     }
 
     fn ma_enabled_id(idx: usize) -> String {
@@ -1261,16 +1369,14 @@ mod web_app {
     }
 
     fn rendered_range() -> Option<(i64, i64)> {
-        CLIENT_VIEW_RANGE
-            .with(|state| *state.borrow())
-            .or_else(|| {
-                LAST_RENDERED_CANDLES.with(|state| {
-                    let candles = state.borrow();
-                    let first = candles.first()?.timestamp;
-                    let last = candles.last()?.timestamp;
-                    Some((first.min(last), first.max(last)))
-                })
+        CLIENT_VIEW_RANGE.with(|state| *state.borrow()).or_else(|| {
+            LAST_RENDERED_CANDLES.with(|state| {
+                let candles = state.borrow();
+                let first = candles.first()?.timestamp;
+                let last = candles.last()?.timestamp;
+                Some((first.min(last), first.max(last)))
             })
+        })
     }
 
     fn loaded_bounds() -> Option<(i64, i64)> {
@@ -1624,7 +1730,9 @@ mod web_app {
         let y_pad_log = (y_span_log * 0.06).max(1.0);
 
         let use_log_scale = log_scale && y_min_log > 0.0;
-        let stretch_factor = Y_STRETCH_FACTOR.with(|state| *state.borrow()).clamp(0.2, 25.0);
+        let stretch_factor = Y_STRETCH_FACTOR
+            .with(|state| *state.borrow())
+            .clamp(0.2, 25.0);
         let (y_low, y_high) = if use_log_scale {
             let base_low = y_min_log;
             let base_high = y_max_log + y_pad_log;
@@ -1642,7 +1750,10 @@ mod web_app {
             let center = (base_low + base_high) / 2.0;
             let half_span = ((base_high - base_low) / 2.0).max(1.0) * stretch_factor;
             let pan_offset = Y_PAN_LINEAR_OFFSET.with(|state| *state.borrow());
-            (center - half_span + pan_offset, center + half_span + pan_offset)
+            (
+                center - half_span + pan_offset,
+                center + half_span + pan_offset,
+            )
         };
         CHART_VIEW.with(|view| {
             *view.borrow_mut() = Some(ChartView {
@@ -1674,7 +1785,11 @@ mod web_app {
                 let start = start.clamp(x_start, x_end);
                 let end = end.clamp(x_start, x_end);
                 let label_x = start + ((end - start).max(60) / 2);
-                (start.min(end), start.max(end), label_x.clamp(x_start, x_end))
+                (
+                    start.min(end),
+                    start.max(end),
+                    label_x.clamp(x_start, x_end),
+                )
             })
             .unwrap_or((x_start, x_start, x_start));
         let measure_label = measure_range.map(|(start, end)| format_duration_human(end - start));
@@ -1735,9 +1850,9 @@ mod web_app {
             for (ratio, level_price) in &visible_fib_levels {
                 chart
                     .draw_series(LineSeries::new(
-                            vec![(fib_x_start, *level_price), (fib_x_end, *level_price)],
-                            &RGBColor(173, 104, 32),
-                        ))
+                        vec![(fib_x_start, *level_price), (fib_x_end, *level_price)],
+                        &RGBColor(173, 104, 32),
+                    ))
                     .map_err(|e| JsValue::from_str(&format!("fib draw error: {e}")))?;
                 chart
                     .draw_series(std::iter::once(Text::new(
@@ -1841,9 +1956,9 @@ mod web_app {
             for (ratio, level_price) in &visible_fib_levels {
                 chart
                     .draw_series(LineSeries::new(
-                            vec![(fib_x_start, *level_price), (fib_x_end, *level_price)],
-                            &RGBColor(173, 104, 32),
-                        ))
+                        vec![(fib_x_start, *level_price), (fib_x_end, *level_price)],
+                        &RGBColor(173, 104, 32),
+                    ))
                     .map_err(|e| JsValue::from_str(&format!("fib draw error: {e}")))?;
                 chart
                     .draw_series(std::iter::once(Text::new(
@@ -2020,7 +2135,13 @@ mod web_app {
         LAST_RENDERED_CANDLES.with(|state| {
             *state.borrow_mut() = visible.clone();
         });
-        render_status(&visible, log_scale, &ma_configs, Some(request_ms), Some(total_ms));
+        render_status(
+            &visible,
+            log_scale,
+            &ma_configs,
+            Some(request_ms),
+            Some(total_ms),
+        );
 
         Ok(())
     }
@@ -2035,7 +2156,10 @@ mod web_app {
         let now_secs = (Date::now() / 1000.0) as i64;
         let back_30_days = now_secs - 30 * 24 * 60 * 60;
         if input_value("ts-start-human")?.is_empty() {
-            set_input_value("ts-start-human", &unix_seconds_to_datetime_local(back_30_days))?;
+            set_input_value(
+                "ts-start-human",
+                &unix_seconds_to_datetime_local(back_30_days),
+            )?;
         }
         if input_value("ts-end-human")?.is_empty() {
             set_input_value("ts-end-human", &unix_seconds_to_datetime_local(now_secs))?;
@@ -2050,6 +2174,12 @@ mod web_app {
         let load_button = doc
             .get_element_by_id("load")
             .ok_or_else(|| JsValue::from_str("missing load button"))?;
+        let api_base_input = doc
+            .get_element_by_id("api-base")
+            .ok_or_else(|| JsValue::from_str("missing api-base input"))?;
+        let db_select = doc
+            .get_element_by_id("db")
+            .ok_or_else(|| JsValue::from_str("missing db select"))?;
         let log_scale_toggle_button = doc
             .get_element_by_id("log-scale-toggle")
             .ok_or_else(|| JsValue::from_str("missing log scale toggle button"))?;
@@ -2119,6 +2249,64 @@ mod web_app {
             .add_event_listener_with_callback("click", load_callback.as_ref().unchecked_ref())?;
         load_callback.forget();
 
+        let api_base_change_callback = Closure::wrap(Box::new(move || {
+            if let Err(err) = save_inputs() {
+                set_status(&format!("failed: {:?}", err));
+                return;
+            }
+            if let Err(err) = connect_realtime_ws() {
+                set_status(&format!("failed: {:?}", err));
+                return;
+            }
+            if let Err(err) = set_load_button_loading(true) {
+                set_status(&format!("failed: {:?}", err));
+                return;
+            }
+            spawn_local(async {
+                if let Err(err) = fetch_and_draw().await {
+                    set_status(&format!("failed: {:?}", err));
+                }
+                if let Err(err) = set_load_button_loading(false) {
+                    set_status(&format!("failed: {:?}", err));
+                }
+            });
+        }) as Box<dyn FnMut()>);
+
+        api_base_input.add_event_listener_with_callback(
+            "change",
+            api_base_change_callback.as_ref().unchecked_ref(),
+        )?;
+        api_base_change_callback.forget();
+
+        let db_change_callback = Closure::wrap(Box::new(move || {
+            if let Err(err) = save_inputs() {
+                set_status(&format!("failed: {:?}", err));
+                return;
+            }
+            if let Err(err) = connect_realtime_ws() {
+                set_status(&format!("failed: {:?}", err));
+                return;
+            }
+            if let Err(err) = set_load_button_loading(true) {
+                set_status(&format!("failed: {:?}", err));
+                return;
+            }
+            spawn_local(async {
+                if let Err(err) = fetch_and_draw().await {
+                    set_status(&format!("failed: {:?}", err));
+                }
+                if let Err(err) = set_load_button_loading(false) {
+                    set_status(&format!("failed: {:?}", err));
+                }
+            });
+        }) as Box<dyn FnMut()>);
+
+        db_select.add_event_listener_with_callback(
+            "change",
+            db_change_callback.as_ref().unchecked_ref(),
+        )?;
+        db_change_callback.forget();
+
         let keydown_callback = Closure::wrap(Box::new(move |event: KeyboardEvent| {
             if (event.ctrl_key() || event.meta_key()) && event.key().eq_ignore_ascii_case("z") {
                 event.prevent_default();
@@ -2178,7 +2366,8 @@ mod web_app {
             }
         }) as Box<dyn FnMut(WheelEvent)>);
 
-        chart_canvas.add_event_listener_with_callback("wheel", wheel_callback.as_ref().unchecked_ref())?;
+        chart_canvas
+            .add_event_listener_with_callback("wheel", wheel_callback.as_ref().unchecked_ref())?;
         wheel_callback.forget();
 
         let log_scale_callback = Closure::wrap(Box::new(move || {
@@ -2335,10 +2524,8 @@ mod web_app {
                 return;
             }
             if fib_enabled {
-                let has_anchor_a =
-                    FIB_STATE.with(|state| state.borrow().anchor_a.is_some());
-                let has_anchor_b =
-                    FIB_STATE.with(|state| state.borrow().anchor_b.is_some());
+                let has_anchor_a = FIB_STATE.with(|state| state.borrow().anchor_a.is_some());
+                let has_anchor_b = FIB_STATE.with(|state| state.borrow().anchor_b.is_some());
                 if has_anchor_a && has_anchor_b {
                     set_status("Fib tool enabled");
                     set_fib_popup_info("Fib restored. Click chart to start a new Fib.");
@@ -2468,16 +2655,14 @@ mod web_app {
             ma_period_callback.forget();
         }
 
-        let settings_toggle_callback = Closure::wrap(Box::new(move || {
-            match settings_visible() {
-                Ok(visible) => {
-                    if let Err(err) = set_settings_visible(!visible) {
-                        set_status(&format!("failed to toggle settings: {:?}", err));
-                    }
+        let settings_toggle_callback = Closure::wrap(Box::new(move || match settings_visible() {
+            Ok(visible) => {
+                if let Err(err) = set_settings_visible(!visible) {
+                    set_status(&format!("failed to toggle settings: {:?}", err));
                 }
-                Err(err) => {
-                    set_status(&format!("failed to read settings state: {:?}", err));
-                }
+            }
+            Err(err) => {
+                set_status(&format!("failed to read settings state: {:?}", err));
             }
         }) as Box<dyn FnMut()>);
 
@@ -2487,17 +2672,15 @@ mod web_app {
         )?;
         settings_toggle_callback.forget();
 
-        let settings_side_toggle_callback = Closure::wrap(Box::new(move || {
-            match settings_side() {
-                Ok(current) => {
-                    let next = if current == "left" { "right" } else { "left" };
-                    if let Err(err) = set_settings_side(next) {
-                        set_status(&format!("failed to move settings card: {:?}", err));
-                    }
+        let settings_side_toggle_callback = Closure::wrap(Box::new(move || match settings_side() {
+            Ok(current) => {
+                let next = if current == "left" { "right" } else { "left" };
+                if let Err(err) = set_settings_side(next) {
+                    set_status(&format!("failed to move settings card: {:?}", err));
                 }
-                Err(err) => {
-                    set_status(&format!("failed to read settings side: {:?}", err));
-                }
+            }
+            Err(err) => {
+                set_status(&format!("failed to read settings side: {:?}", err));
             }
         }) as Box<dyn FnMut()>);
 
@@ -2558,8 +2741,8 @@ mod web_app {
         )?;
         ma_drag_move_callback.forget();
 
-        let connection_settings_toggle_callback = Closure::wrap(Box::new(move || {
-            match connection_settings_visible() {
+        let connection_settings_toggle_callback =
+            Closure::wrap(Box::new(move || match connection_settings_visible() {
                 Ok(visible) => {
                     if let Err(err) = set_connection_settings_visible(!visible) {
                         set_status(&format!("failed to toggle connection settings: {:?}", err));
@@ -2571,8 +2754,7 @@ mod web_app {
                         err
                     ));
                 }
-            }
-        }) as Box<dyn FnMut()>);
+            }) as Box<dyn FnMut()>);
 
         connection_settings_toggle_button.add_event_listener_with_callback(
             "click",
@@ -2580,12 +2762,15 @@ mod web_app {
         )?;
         connection_settings_toggle_callback.forget();
 
-        let connection_settings_side_toggle_callback = Closure::wrap(Box::new(move || {
-            match connection_settings_side() {
+        let connection_settings_side_toggle_callback =
+            Closure::wrap(Box::new(move || match connection_settings_side() {
                 Ok(current) => {
                     let next = if current == "left" { "right" } else { "left" };
                     if let Err(err) = set_connection_settings_side(next) {
-                        set_status(&format!("failed to move connection settings card: {:?}", err));
+                        set_status(&format!(
+                            "failed to move connection settings card: {:?}",
+                            err
+                        ));
                     }
                 }
                 Err(err) => {
@@ -2594,14 +2779,15 @@ mod web_app {
                         err
                     ));
                 }
-            }
-        }) as Box<dyn FnMut()>);
+            }) as Box<dyn FnMut()>);
 
         if let Some(connection_settings_side_toggle_button) = connection_settings_side_toggle_button
         {
             connection_settings_side_toggle_button.add_event_listener_with_callback(
                 "click",
-                connection_settings_side_toggle_callback.as_ref().unchecked_ref(),
+                connection_settings_side_toggle_callback
+                    .as_ref()
+                    .unchecked_ref(),
             )?;
         }
         connection_settings_side_toggle_callback.forget();
@@ -2678,7 +2864,10 @@ mod web_app {
             }
         }) as Box<dyn FnMut(MouseEvent)>);
 
-        doc.add_event_listener_with_callback("mouseup", drag_end_callback.as_ref().unchecked_ref())?;
+        doc.add_event_listener_with_callback(
+            "mouseup",
+            drag_end_callback.as_ref().unchecked_ref(),
+        )?;
         drag_end_callback.forget();
 
         let move_canvas = chart_canvas.clone();
@@ -2811,7 +3000,8 @@ mod web_app {
                     let plot_height = (plot_bottom - plot_top).max(1.0);
                     let span_x = (drag.ts_end - drag.ts_start).max(60) as f64;
                     let shift_seconds = (-(dx as f64) / plot_width * span_x).round() as i64;
-                    let next_y_offset = drag.y_offset_start + (dy as f64 / plot_height) * drag.y_span;
+                    let next_y_offset =
+                        drag.y_offset_start + (dy as f64 / plot_height) * drag.y_span;
                     let y_changed = if drag.use_log_scale {
                         set_y_pan_log_offset(next_y_offset)
                     } else {
@@ -2886,10 +3076,11 @@ mod web_app {
                 };
                 let snapped_candle = nearest_candle_for_timestamp(&candles, cursor_ts);
                 let text = unix_seconds_to_hover_text(cursor_ts);
-                let default_price = snapped_candle.map(|c| c.close).unwrap_or_else(|| {
-                    candles.last().map(|c| c.close).unwrap_or(0.0)
-                });
-                let usd_price = match price_from_canvas_y(crosshair_y as f64, plot_top, plot_bottom) {
+                let default_price = snapped_candle
+                    .map(|c| c.close)
+                    .unwrap_or_else(|| candles.last().map(|c| c.close).unwrap_or(0.0));
+                let usd_price = match price_from_canvas_y(crosshair_y as f64, plot_top, plot_bottom)
+                {
                     Some(v) => {
                         show_cursor_hline(
                             overlay_y,
@@ -2929,11 +3120,7 @@ mod web_app {
                 set_fib_popup_info(&fib_text);
                 show_hover_tooltip(&tooltip_text, overlay_x, overlay_y);
                 show_cursor_time_label(&label_text, overlay_x);
-                show_cursor_vline(
-                    overlay_x,
-                    canvas_top + plot_top,
-                    canvas_top + plot_bottom,
-                );
+                show_cursor_vline(overlay_x, canvas_top + plot_top, canvas_top + plot_bottom);
                 show_rsi_cursor_vline(crosshair_x);
             }
             if need_fib_redraw {
@@ -2964,11 +3151,11 @@ mod web_app {
                     None => return,
                 };
                 let crosshair_x = (event.offset_x() as f64).clamp(plot_left, plot_right);
-                let cursor_ts = match timestamp_from_canvas_x(canvas_width, canvas_height, crosshair_x)
-                {
-                    Some(v) => v,
-                    None => return,
-                };
+                let cursor_ts =
+                    match timestamp_from_canvas_x(canvas_width, canvas_height, crosshair_x) {
+                        Some(v) => v,
+                        None => return,
+                    };
                 MEASURE_STATE.with(|state| {
                     let mut cfg = state.borrow_mut();
                     cfg.anchor_a = Some(cursor_ts);
@@ -2999,11 +3186,11 @@ mod web_app {
 
                 let crosshair_x = (event.offset_x() as f64).clamp(plot_left, plot_right);
                 let crosshair_y = (event.offset_y() as f64).clamp(plot_top, plot_bottom);
-                let cursor_ts = match timestamp_from_canvas_x(canvas_width, canvas_height, crosshair_x)
-                {
-                    Some(v) => v,
-                    None => return,
-                };
+                let cursor_ts =
+                    match timestamp_from_canvas_x(canvas_width, canvas_height, crosshair_x) {
+                        Some(v) => v,
+                        None => return,
+                    };
                 let price = price_from_canvas_y(crosshair_y, plot_top, plot_bottom)
                     .unwrap_or_else(|| candles.last().map(|c| c.close).unwrap_or(0.0));
 
@@ -3231,6 +3418,7 @@ mod web_app {
     pub fn start() -> Result<(), JsValue> {
         setup_defaults()?;
         register_button_handler()?;
+        connect_realtime_ws()?;
         spawn_local(async {
             if let Err(err) = fetch_and_draw().await {
                 set_status(&format!("failed: {:?}", err));

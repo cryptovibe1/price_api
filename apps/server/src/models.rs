@@ -46,7 +46,10 @@ impl Period {
         let digits_len = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
 
         if digits_len == 0 || digits_len == trimmed.len() {
-            return Err("period must look like 1min, 1hour, 1day, 1week, 1month".to_string());
+            return Err(
+                "period must look like 1min/1mins, 1hour/1hours, 1day/1days, 1week/1weeks, 1month/1months"
+                    .to_string(),
+            );
         }
 
         let size = trimmed[..digits_len]
@@ -58,12 +61,17 @@ impl Period {
         }
 
         let unit = match &trimmed[digits_len..] {
-            "min" | "minute" | "minutes" => Unit::Minute,
+            "min" | "mins" | "minute" | "minutes" => Unit::Minute,
             "hour" | "hours" => Unit::Hour,
             "day" | "days" => Unit::Day,
             "week" | "weeks" => Unit::Week,
             "month" | "months" => Unit::Month,
-            _ => return Err("period unit must be min/hour/day/week/month".to_string()),
+            _ => {
+                return Err(
+                    "period unit must be min/mins/hour/hours/day/days/week/weeks/month/months"
+                        .to_string(),
+                )
+            }
         };
 
         Ok(Self { size, unit })

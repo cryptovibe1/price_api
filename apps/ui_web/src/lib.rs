@@ -47,6 +47,7 @@ mod web_app {
         static Y_PAN_LOG_OFFSET: RefCell<f64> = const { RefCell::new(0.0) };
         static Y_STRETCH_DRAG: RefCell<Option<YStretchDrag>> = const { RefCell::new(None) };
         static FIB_STATE: RefCell<FibState> = const { RefCell::new(FibState::new()) };
+        static FIB_LEVEL_DRAG: RefCell<Option<FibLevelDrag>> = const { RefCell::new(None) };
         static FIB_PREVIEW_POINT: RefCell<Option<(i64, f64)>> = const { RefCell::new(None) };
         static MEASURE_DRAG_TS: RefCell<Option<i64>> = const { RefCell::new(None) };
         static FIB_POPUP_DRAG: RefCell<Option<(f64, f64)>> = const { RefCell::new(None) };
@@ -90,6 +91,9 @@ mod web_app {
         start_y: i32,
         start_factor: f64,
     }
+
+    #[derive(Clone, Copy)]
+    struct FibLevelDrag;
 
     struct LiveWsConnection {
         ws: WebSocket,
@@ -375,6 +379,70 @@ mod web_app {
             }
             changed
         })
+    }
+
+    fn finished_fib_primary_level_price() -> Option<f64> {
+        FIB_STATE.with(|state| {
+            let cfg = *state.borrow();
+            match (cfg.anchor_a, cfg.anchor_b) {
+                (Some((_, price)), Some(_)) => Some(price),
+                _ => None,
+            }
+        })
+    }
+
+    fn set_fib_primary_level_price(next_price: f64) -> bool {
+        FIB_STATE.with(|state| {
+            let mut cfg = state.borrow_mut();
+            let Some((ts, current_price)) = cfg.anchor_a else {
+                return false;
+            };
+            if cfg.anchor_b.is_none() || (current_price - next_price).abs() < 0.01 {
+                return false;
+            }
+            cfg.anchor_a = Some((ts, next_price));
+            true
+        })
+    }
+
+    fn canvas_y_from_price(price: f64, plot_top: f64, plot_bottom: f64) -> Option<f64> {
+        if plot_bottom <= plot_top {
+            return None;
+        }
+
+        CHART_VIEW.with(|view| {
+            let cfg = (*view.borrow())?;
+            if cfg.use_log_scale {
+                if cfg.y_low <= 0.0 || cfg.y_high <= 0.0 || price <= 0.0 {
+                    return None;
+                }
+                let low_ln = cfg.y_low.ln();
+                let high_ln = cfg.y_high.ln();
+                if high_ln <= low_ln {
+                    return None;
+                }
+                let price_ln = price.ln();
+                let ratio = ((price_ln - low_ln) / (high_ln - low_ln)).clamp(0.0, 1.0);
+                Some(plot_bottom - ratio * (plot_bottom - plot_top))
+            } else {
+                let span = cfg.y_high - cfg.y_low;
+                if span.abs() < f64::EPSILON {
+                    return None;
+                }
+                let ratio = ((price - cfg.y_low) / span).clamp(0.0, 1.0);
+                Some(plot_bottom - ratio * (plot_bottom - plot_top))
+            }
+        })
+    }
+
+    fn fib_primary_line_hit_test(offset_y: f64, plot_top: f64, plot_bottom: f64) -> bool {
+        let Some(line_price) = finished_fib_primary_level_price() else {
+            return false;
+        };
+        let Some(line_y) = canvas_y_from_price(line_price, plot_top, plot_bottom) else {
+            return false;
+        };
+        (offset_y - line_y).abs() <= 8.0
     }
 
     fn redraw_visible_chart_only() -> Result<(), JsValue> {
@@ -2952,6 +3020,33 @@ mod web_app {
                     return;
                 }
 
+                if FIB_LEVEL_DRAG.with(|state| state.borrow().is_some()) {
+                    let dragged_price =
+                        price_from_canvas_y(event.offset_y() as f64, plot_top, plot_bottom);
+                    if let Some(price) = dragged_price {
+                        show_cursor_hline(
+                            crosshair_y,
+                            canvas_left + plot_left,
+                            canvas_left + plot_right,
+                        );
+                        if set_fib_primary_level_price(price) {
+                            if let Err(err) = redraw_visible_chart_only() {
+                                set_status(&format!("failed: {:?}", err));
+                            }
+                        }
+                        set_status(&format!("Fib 1.0 moved to {:.2}", price));
+                        set_fib_popup_info(&format!("Dragging Fib 1.0 (100%) to {:.2}", price));
+                    } else {
+                        hide_cursor_hline();
+                    }
+                    hide_hover_tooltip();
+                    hide_cursor_time_label();
+                    hide_cursor_vline();
+                    hide_rsi_cursor_vline();
+                    set_chart_cursor("ns-resize");
+                    return;
+                }
+
                 let measure_enabled = MEASURE_STATE.with(|state| state.borrow().enabled);
                 let measure_anchor_a = MEASURE_STATE.with(|state| state.borrow().anchor_a);
                 if measure_enabled && measure_anchor_a.is_some() {
@@ -3095,6 +3190,18 @@ mod web_app {
                     }
                 };
 
+                let fib_line_hover = !event.shift_key()
+                    && !measure_enabled
+                    && !DRAG_TOOL_ENABLED.with(|state| *state.borrow())
+                    && fib_primary_line_hit_test(crosshair_y as f64, plot_top, plot_bottom);
+                if fib_line_hover {
+                    set_chart_cursor("ns-resize");
+                } else if DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
+                    set_chart_cursor("move");
+                } else {
+                    set_chart_cursor("default");
+                }
+
                 let tooltip_text = match snapped_candle {
                     Some(candle) => format!(
                         "{} | O {:.2} H {:.2} L {:.2} C {:.2} | USD {:.2}",
@@ -3104,6 +3211,11 @@ mod web_app {
                 };
                 let label_text = format!("{} | USD {:.2}", text, usd_price);
                 let fib_text = fib_popup_text_for_cursor(cursor_ts, usd_price);
+                let fib_popup_text = if fib_line_hover {
+                    format!("Drag Fib 1.0 (100%) line. Cursor price {:.2}", usd_price)
+                } else {
+                    fib_text
+                };
                 let fib_preview = FIB_STATE.with(|fib| {
                     let cfg = *fib.borrow();
                     if cfg.enabled && cfg.anchor_a.is_some() && cfg.anchor_b.is_none() {
@@ -3117,7 +3229,7 @@ mod web_app {
                 }
 
                 set_hover_info(&format!("Hover time: {} | USD {:.2}", text, usd_price));
-                set_fib_popup_info(&fib_text);
+                set_fib_popup_info(&fib_popup_text);
                 show_hover_tooltip(&tooltip_text, overlay_x, overlay_y);
                 show_cursor_time_label(&label_text, overlay_x);
                 show_cursor_vline(overlay_x, canvas_top + plot_top, canvas_top + plot_bottom);
@@ -3143,13 +3255,15 @@ mod web_app {
                 return;
             }
 
-            if MEASURE_STATE.with(|state| state.borrow().enabled) && !event.shift_key() {
-                let canvas_width = fib_canvas.client_width() as f64;
-                let canvas_height = fib_canvas.client_height() as f64;
-                let (plot_left, plot_right, _, _) = match plot_bounds(canvas_width, canvas_height) {
+            let canvas_width = fib_canvas.client_width() as f64;
+            let canvas_height = fib_canvas.client_height() as f64;
+            let (plot_left, plot_right, plot_top, plot_bottom) =
+                match plot_bounds(canvas_width, canvas_height) {
                     Some(v) => v,
                     None => return,
                 };
+
+            if MEASURE_STATE.with(|state| state.borrow().enabled) && !event.shift_key() {
                 let crosshair_x = (event.offset_x() as f64).clamp(plot_left, plot_right);
                 let cursor_ts =
                     match timestamp_from_canvas_x(canvas_width, canvas_height, crosshair_x) {
@@ -3174,16 +3288,22 @@ mod web_app {
                 return;
             }
 
+            let offset_y = event.offset_y() as f64;
+            if !event.shift_key()
+                && !DRAG_TOOL_ENABLED.with(|state| *state.borrow())
+                && fib_primary_line_hit_test(offset_y, plot_top, plot_bottom)
+            {
+                FIB_LEVEL_DRAG.with(|state| {
+                    *state.borrow_mut() = Some(FibLevelDrag);
+                });
+                set_chart_cursor("ns-resize");
+                set_status("Dragging Fib 1.0 (100%) line");
+                set_fib_popup_info("Drag Fib 1.0 (100%) line to reposition it.");
+                return;
+            }
+
             if FIB_STATE.with(|fib| fib.borrow().enabled) && !event.shift_key() {
                 let _ = set_fib_preview_point(None);
-                let canvas_width = fib_canvas.client_width() as f64;
-                let canvas_height = fib_canvas.client_height() as f64;
-                let (plot_left, plot_right, plot_top, plot_bottom) =
-                    match plot_bounds(canvas_width, canvas_height) {
-                        Some(v) => v,
-                        None => return,
-                    };
-
                 let crosshair_x = (event.offset_x() as f64).clamp(plot_left, plot_right);
                 let crosshair_y = (event.offset_y() as f64).clamp(plot_top, plot_bottom);
                 let cursor_ts =
@@ -3250,15 +3370,7 @@ mod web_app {
                 set_chart_cursor("grabbing");
                 set_status("Pan mode: move mouse left/right");
             } else if DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
-                let canvas_width = fib_canvas.client_width() as f64;
-                let canvas_height = fib_canvas.client_height() as f64;
-                let (plot_left, plot_right, plot_top, plot_bottom) =
-                    match plot_bounds(canvas_width, canvas_height) {
-                        Some(v) => v,
-                        None => return,
-                    };
                 let offset_x = event.offset_x() as f64;
-                let offset_y = event.offset_y() as f64;
                 if offset_x >= plot_left
                     && offset_x <= plot_right
                     && offset_y >= plot_top
@@ -3294,13 +3406,6 @@ mod web_app {
                     set_status("Drag tool: pan X and Y");
                 }
             } else {
-                let canvas_width = fib_canvas.client_width() as f64;
-                let canvas_height = fib_canvas.client_height() as f64;
-                let (_, _, plot_top, plot_bottom) = match plot_bounds(canvas_width, canvas_height) {
-                    Some(v) => v,
-                    None => return,
-                };
-                let offset_y = event.offset_y() as f64;
                 if offset_y >= plot_top && offset_y <= plot_bottom {
                     let start_factor = Y_STRETCH_FACTOR.with(|state| *state.borrow());
                     Y_STRETCH_DRAG.with(|state| {
@@ -3334,6 +3439,8 @@ mod web_app {
             CHART_DRAG.with(|state| {
                 *state.borrow_mut() = None;
             });
+            let fib_line_drag_finished =
+                FIB_LEVEL_DRAG.with(|state| state.borrow_mut().take().is_some());
             Y_STRETCH_DRAG.with(|state| {
                 *state.borrow_mut() = None;
             });
@@ -3366,6 +3473,12 @@ mod web_app {
             }
             if DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
                 set_chart_cursor("move");
+            } else if fib_line_drag_finished {
+                set_chart_cursor("default");
+                if let Some(price) = finished_fib_primary_level_price() {
+                    set_status(&format!("Fib 1.0 fixed at {:.2}", price));
+                    set_fib_popup_info(&format!("Fib 1.0 (100%) moved to {:.2}", price));
+                }
             } else {
                 set_chart_cursor("default");
             }
@@ -3386,6 +3499,9 @@ mod web_app {
                 *state.borrow_mut() = 0.0;
             });
             CHART_DRAG.with(|state| {
+                *state.borrow_mut() = None;
+            });
+            FIB_LEVEL_DRAG.with(|state| {
                 *state.borrow_mut() = None;
             });
             Y_STRETCH_DRAG.with(|state| {

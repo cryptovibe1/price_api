@@ -14,7 +14,7 @@ Create salvo rest ap endpoints regarding databases
 /candles/timescale/btc/usd
 /candles/clickhouse/btc/usd
 query params:
-period: '1min', '1hour', '1day', '1week', '1month' // where 1 can be changed by n
+period: '1min', '1mins', '1hour', '1hours', '1day', '1days', '1week', '1weeks', '1month', '1months' // where 1 can be changed by n
 ts_start: {timestamp}
 ts_end: {timestamp}
 

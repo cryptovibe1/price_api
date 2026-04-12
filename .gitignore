@@ -2,7 +2,10 @@ btcusd_bitstamp_1min_2012-2025.csv.gz
 btcusd_bitstamp_1min_2012-2025.csv
 btcusd_bitstamp_1min_latest.csv
 btcusd_bitstamp_1min_latest_patch.csv
+comprehensive-ethusd-1m-data.zip
+ETHUSD_1m_Coinbase.csv
 target/
 Cargo.lock
 apps/ui_web/dist
 sandbox/
+

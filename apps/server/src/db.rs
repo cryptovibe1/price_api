@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use sqlx::{postgres::PgPoolOptions, postgres::PgRow, PgPool, Postgres, QueryBuilder, Row};
 
 use crate::config::AppConfig;
-use crate::models::{Candle, DbKind, Period};
+use crate::models::{Candle, DbKind, MarketPair, Period};
 
 #[derive(Clone)]
 pub struct CandleRepository {
@@ -20,21 +20,25 @@ impl CandleRepository {
         self.db
     }
 
-    pub async fn latest_candle_ts(&self) -> Result<Option<i64>, sqlx::Error> {
-        let row: PgRow = sqlx::query("SELECT MAX(timestamp) AS max_ts FROM btc_usd")
-            .fetch_one(&self.pool)
-            .await?;
+    pub async fn latest_candle_ts(&self, pair: MarketPair) -> Result<Option<i64>, sqlx::Error> {
+        let sql = format!("SELECT MAX(timestamp) AS max_ts FROM {}", pair.table_name());
+        let row: PgRow = sqlx::query(&sql).fetch_one(&self.pool).await?;
         row.try_get::<Option<i64>, _>("max_ts")
     }
 
-    pub async fn insert_candles(&self, candles: &[Candle]) -> Result<u64, sqlx::Error> {
+    pub async fn insert_candles(
+        &self,
+        pair: MarketPair,
+        candles: &[Candle],
+    ) -> Result<u64, sqlx::Error> {
         if candles.is_empty() {
             return Ok(0);
         }
 
-        let mut builder = QueryBuilder::<Postgres>::new(
-            "INSERT INTO btc_usd (timestamp, open, high, low, close, volume) ",
-        );
+        let mut builder = QueryBuilder::<Postgres>::new(&format!(
+            "INSERT INTO {} (timestamp, open, high, low, close, volume) ",
+            pair.table_name()
+        ));
         builder.push_values(candles, |mut b, candle| {
             b.push_bind(candle.timestamp)
                 .push_bind(candle.open)
@@ -51,11 +55,12 @@ impl CandleRepository {
 
     pub async fn query_aggregated(
         &self,
+        pair: MarketPair,
         period: Period,
         ts_start: i64,
         ts_end: i64,
     ) -> Result<Vec<Candle>, sqlx::Error> {
-        let sql = aggregation_sql(period);
+        let sql = aggregation_sql(pair, period);
         sqlx::query_as::<_, Candle>(&sql)
             .bind(ts_start)
             .bind(ts_end)
@@ -81,7 +86,8 @@ pub async fn connect_repositories(config: &AppConfig) -> HashMap<DbKind, CandleR
     repos
 }
 
-fn aggregation_sql(period: Period) -> String {
+fn aggregation_sql(pair: MarketPair, period: Period) -> String {
+    let table = pair.table_name();
     if let Some(bucket_seconds) = period.as_seconds() {
         return format!(
             "
@@ -92,7 +98,7 @@ fn aggregation_sql(period: Period) -> String {
                 MIN(low)::DOUBLE PRECISION AS low,
                 (ARRAY_AGG(close ORDER BY timestamp DESC))[1]::DOUBLE PRECISION AS close,
                 SUM(volume)::DOUBLE PRECISION AS volume
-            FROM btc_usd
+            FROM {table}
             WHERE timestamp BETWEEN $1 AND $2
             GROUP BY 1
             ORDER BY 1
@@ -118,7 +124,7 @@ fn aggregation_sql(period: Period) -> String {
                         - 1
                     ) / {month_size}
                 ) * {month_size} AS month_bucket
-            FROM btc_usd
+            FROM {table}
             WHERE timestamp BETWEEN $1 AND $2
         )
         SELECT

@@ -2,6 +2,15 @@
 name = "price-api-server"
 version = "0.1.0"
 edition = "2021"
+default-run = "price-api-server"
+
+[[bin]]
+name = "price-api-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "price-api-worker"
+path = "src/bin/worker.rs"
 
 [dependencies]
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }

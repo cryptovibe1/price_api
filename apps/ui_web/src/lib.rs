@@ -59,6 +59,7 @@ mod web_app {
 
     const STORAGE_KEY_API_BASE: &str = "price_api.api_base";
     const STORAGE_KEY_DB: &str = "price_api.db";
+    const STORAGE_KEY_CHART_SOURCE: &str = "price_api.chart_source";
     const STORAGE_KEY_PERIOD: &str = "price_api.period";
     const STORAGE_KEY_TS_START: &str = "price_api.ts_start_human";
     const STORAGE_KEY_TS_END: &str = "price_api.ts_end_human";
@@ -953,6 +954,7 @@ mod web_app {
         let storage = storage()?;
         storage.set_item(STORAGE_KEY_API_BASE, &input_value("api-base")?)?;
         storage.set_item(STORAGE_KEY_DB, &select_value("db")?)?;
+        storage.set_item(STORAGE_KEY_CHART_SOURCE, &select_value("chart-source")?)?;
         storage.set_item(STORAGE_KEY_PERIOD, &input_value("period")?)?;
         storage.set_item(STORAGE_KEY_TS_START, &input_value("ts-start-human")?)?;
         storage.set_item(STORAGE_KEY_TS_END, &input_value("ts-end-human")?)?;
@@ -991,6 +993,11 @@ mod web_app {
         if let Some(v) = storage.get_item(STORAGE_KEY_DB)? {
             if !v.is_empty() {
                 set_select_value("db", &v)?;
+            }
+        }
+        if let Some(v) = storage.get_item(STORAGE_KEY_CHART_SOURCE)? {
+            if !v.is_empty() {
+                set_select_value("chart-source", &v)?;
             }
         }
         if let Some(v) = storage.get_item(STORAGE_KEY_PERIOD)? {
@@ -1092,6 +1099,7 @@ mod web_app {
     fn build_url() -> Result<String, JsValue> {
         let api_base = input_value("api-base")?;
         let db = select_value("db")?;
+        let chart_source = select_value("chart-source")?;
         let period = input_value("period")?;
         let ts_start_human = input_value("ts-start-human")?;
         let ts_end_human = input_value("ts-end-human")?;
@@ -1100,8 +1108,18 @@ mod web_app {
         let ts_end = datetime_local_to_unix_seconds(&ts_end_human)?;
 
         let base = api_base.trim_end_matches('/');
+        let (asset_base, asset_quote) = match chart_source.as_str() {
+            "btc_usd" => ("btc", "usd"),
+            "eth_usd" => ("eth", "usd"),
+            "sol_usd" => ("sol", "usd"),
+            _ => {
+                return Err(JsValue::from_str(
+                    "chart-source must be btc_usd, eth_usd, or sol_usd",
+                ))
+            }
+        };
         Ok(format!(
-            "{base}/candles/{db}/btc/usd?period={period}&ts_start={ts_start}&ts_end={ts_end}"
+            "{base}/candles/{db}/{asset_base}/{asset_quote}?period={period}&ts_start={ts_start}&ts_end={ts_end}"
         ))
     }
 
@@ -2248,6 +2266,9 @@ mod web_app {
         let db_select = doc
             .get_element_by_id("db")
             .ok_or_else(|| JsValue::from_str("missing db select"))?;
+        let chart_source_select = doc
+            .get_element_by_id("chart-source")
+            .ok_or_else(|| JsValue::from_str("missing chart-source select"))?;
         let log_scale_toggle_button = doc
             .get_element_by_id("log-scale-toggle")
             .ok_or_else(|| JsValue::from_str("missing log scale toggle button"))?;
@@ -2374,6 +2395,35 @@ mod web_app {
             db_change_callback.as_ref().unchecked_ref(),
         )?;
         db_change_callback.forget();
+
+        let chart_source_change_callback = Closure::wrap(Box::new(move || {
+            if let Err(err) = save_inputs() {
+                set_status(&format!("failed: {:?}", err));
+                return;
+            }
+            if let Err(err) = connect_realtime_ws() {
+                set_status(&format!("failed: {:?}", err));
+                return;
+            }
+            if let Err(err) = set_load_button_loading(true) {
+                set_status(&format!("failed: {:?}", err));
+                return;
+            }
+            spawn_local(async {
+                if let Err(err) = fetch_and_draw().await {
+                    set_status(&format!("failed: {:?}", err));
+                }
+                if let Err(err) = set_load_button_loading(false) {
+                    set_status(&format!("failed: {:?}", err));
+                }
+            });
+        }) as Box<dyn FnMut()>);
+
+        chart_source_select.add_event_listener_with_callback(
+            "change",
+            chart_source_change_callback.as_ref().unchecked_ref(),
+        )?;
+        chart_source_change_callback.forget();
 
         let keydown_callback = Closure::wrap(Box::new(move |event: KeyboardEvent| {
             if (event.ctrl_key() || event.meta_key()) && event.key().eq_ignore_ascii_case("z") {

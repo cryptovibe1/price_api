@@ -5,6 +5,7 @@ mod web_app {
     use gloo_net::http::Request;
     use js_sys::Date;
     use plotters::prelude::*;
+    use plotters::style::text_anchor::{HPos, Pos, VPos};
     use plotters_canvas::CanvasBackend;
     use serde::Deserialize;
     use wasm_bindgen::closure::Closure;
@@ -1086,6 +1087,43 @@ mod web_app {
         )
     }
 
+    fn y_tick_values(y_low: f64, y_high: f64, use_log: bool, count: usize) -> Vec<f64> {
+        if count == 0 || !y_low.is_finite() || !y_high.is_finite() || y_high <= y_low {
+            return Vec::new();
+        }
+        let n = count as f64;
+        let mut out = Vec::with_capacity(count + 1);
+        let can_log = use_log && y_low > 0.0;
+        let (a, b) = if can_log {
+            (y_low.ln(), y_high.ln())
+        } else {
+            (y_low, y_high)
+        };
+        for i in 0..=count {
+            let t = i as f64 / n;
+            let v = a + (b - a) * t;
+            out.push(if can_log { v.exp() } else { v });
+        }
+        out
+    }
+
+    fn format_price_label(y: f64) -> String {
+        let abs = y.abs();
+        if abs >= 1000.0 {
+            format!("{:.0}", y)
+        } else if abs >= 10.0 {
+            format!("{:.2}", y)
+        } else if abs >= 1.0 {
+            format!("{:.3}", y)
+        } else if abs >= 0.01 {
+            format!("{:.4}", y)
+        } else if abs > 0.0 {
+            format!("{:.6}", y)
+        } else {
+            "0".to_string()
+        }
+    }
+
     fn unix_seconds_to_date_text(ts: i64) -> String {
         let d = Date::new(&JsValue::from_f64((ts * 1000) as f64));
         format!(
@@ -1892,12 +1930,32 @@ mod web_app {
 
             chart
                 .configure_mesh()
-                .x_labels(8)
-                .y_labels(8)
+                .x_labels(12)
                 .disable_x_mesh()
+                .disable_y_mesh()
                 .x_label_formatter(&|x| unix_seconds_to_date_text(*x))
+                .y_label_formatter(&|_| String::new())
                 .draw()
                 .map_err(|e| JsValue::from_str(&format!("mesh draw error: {e}")))?;
+
+            for ty in y_tick_values(y_low, y_high, true, 10) {
+                chart
+                    .draw_series(LineSeries::new(
+                        vec![(x_start, ty), (x_end, ty)],
+                        RGBColor(224, 230, 240).mix(0.7),
+                    ))
+                    .map_err(|e| JsValue::from_str(&format!("y grid draw error: {e}")))?;
+                chart
+                    .draw_series(std::iter::once(Text::new(
+                        format_price_label(ty),
+                        (x_start, ty),
+                        ("sans-serif", 11)
+                            .into_font()
+                            .color(&RGBColor(60, 80, 110))
+                            .pos(Pos::new(HPos::Right, VPos::Center)),
+                    )))
+                    .map_err(|e| JsValue::from_str(&format!("y label draw error: {e}")))?;
+            }
 
             chart
                 .draw_series(candles.iter().map(|c| {
@@ -1918,6 +1976,28 @@ mod web_app {
                 chart
                     .draw_series(LineSeries::new(points.clone(), color))
                     .map_err(|e| JsValue::from_str(&format!("ma draw error: {e}")))?;
+            }
+
+            if let Some(last) = candles.last() {
+                if last.close.is_finite() && last.close >= y_low && last.close <= y_high {
+                    let color = RGBColor(47, 125, 216);
+                    chart
+                        .draw_series(LineSeries::new(
+                            vec![(x_start, last.close), (x_end, last.close)],
+                            color.mix(0.9),
+                        ))
+                        .map_err(|e| JsValue::from_str(&format!("last line draw error: {e}")))?;
+                    chart
+                        .draw_series(std::iter::once(Text::new(
+                            format_price_label(last.close),
+                            (x_end, last.close),
+                            ("sans-serif", 12)
+                                .into_font()
+                                .color(&color)
+                                .pos(Pos::new(HPos::Right, VPos::Center)),
+                        )))
+                        .map_err(|e| JsValue::from_str(&format!("last label draw error: {e}")))?;
+                }
             }
 
             if fib_overlay.is_some() && fib_x_end > fib_x_start {
@@ -1998,12 +2078,32 @@ mod web_app {
 
             chart
                 .configure_mesh()
-                .x_labels(8)
-                .y_labels(8)
+                .x_labels(12)
                 .disable_x_mesh()
+                .disable_y_mesh()
                 .x_label_formatter(&|x| unix_seconds_to_date_text(*x))
+                .y_label_formatter(&|_| String::new())
                 .draw()
                 .map_err(|e| JsValue::from_str(&format!("mesh draw error: {e}")))?;
+
+            for ty in y_tick_values(y_low, y_high, false, 10) {
+                chart
+                    .draw_series(LineSeries::new(
+                        vec![(x_start, ty), (x_end, ty)],
+                        RGBColor(224, 230, 240).mix(0.7),
+                    ))
+                    .map_err(|e| JsValue::from_str(&format!("y grid draw error: {e}")))?;
+                chart
+                    .draw_series(std::iter::once(Text::new(
+                        format_price_label(ty),
+                        (x_start, ty),
+                        ("sans-serif", 11)
+                            .into_font()
+                            .color(&RGBColor(60, 80, 110))
+                            .pos(Pos::new(HPos::Right, VPos::Center)),
+                    )))
+                    .map_err(|e| JsValue::from_str(&format!("y label draw error: {e}")))?;
+            }
 
             chart
                 .draw_series(candles.iter().map(|c| {
@@ -2024,6 +2124,28 @@ mod web_app {
                 chart
                     .draw_series(LineSeries::new(points.clone(), color))
                     .map_err(|e| JsValue::from_str(&format!("ma draw error: {e}")))?;
+            }
+
+            if let Some(last) = candles.last() {
+                if last.close.is_finite() && last.close >= y_low && last.close <= y_high {
+                    let color = RGBColor(47, 125, 216);
+                    chart
+                        .draw_series(LineSeries::new(
+                            vec![(x_start, last.close), (x_end, last.close)],
+                            color.mix(0.9),
+                        ))
+                        .map_err(|e| JsValue::from_str(&format!("last line draw error: {e}")))?;
+                    chart
+                        .draw_series(std::iter::once(Text::new(
+                            format_price_label(last.close),
+                            (x_end, last.close),
+                            ("sans-serif", 12)
+                                .into_font()
+                                .color(&color)
+                                .pos(Pos::new(HPos::Right, VPos::Center)),
+                        )))
+                        .map_err(|e| JsValue::from_str(&format!("last label draw error: {e}")))?;
+                }
             }
 
             if fib_overlay.is_some() && fib_x_end > fib_x_start {

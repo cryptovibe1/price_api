@@ -68,7 +68,7 @@ mod web_app {
     const STORAGE_KEY_SETTINGS_SIDE: &str = "price_api.settings_side";
     const STORAGE_KEY_CONNECTION_SETTINGS_VISIBLE: &str = "price_api.connection_settings_visible";
     const STORAGE_KEY_CONNECTION_SETTINGS_SIDE: &str = "price_api.connection_settings_side";
-    const MA_COUNT: usize = 13;
+    const MA_COUNT: usize = 15;
 
     #[derive(Clone, Copy)]
     struct MovingAverageConfig {
@@ -1240,7 +1240,9 @@ mod web_app {
             10 => 987,
             11 => 1597,
             12 => 2584,
-            _ => 4181,
+            13 => 4181,
+            14 => 6765,
+            _ => 10946,
         }
     }
 

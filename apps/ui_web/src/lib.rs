@@ -1134,7 +1134,44 @@ mod web_app {
         )
     }
 
-    fn build_url() -> Result<String, JsValue> {
+    enum ChartRequest {
+        Direct(String),
+        Ratio { num_url: String, den_url: String },
+    }
+
+    fn chart_source_pairs(
+        source: &str,
+    ) -> Result<((&'static str, &'static str), Option<(&'static str, &'static str)>), JsValue> {
+        match source {
+            "btc_usd" => Ok((("btc", "usd"), None)),
+            "eth_usd" => Ok((("eth", "usd"), None)),
+            "sol_usd" => Ok((("sol", "usd"), None)),
+            "eth_btc" => Ok((("eth", "usd"), Some(("btc", "usd")))),
+            "sol_btc" => Ok((("sol", "usd"), Some(("btc", "usd")))),
+            "sol_eth" => Ok((("sol", "usd"), Some(("eth", "usd")))),
+            _ => Err(JsValue::from_str(
+                "chart-source must be btc_usd, eth_usd, sol_usd, eth_btc, sol_btc, or sol_eth",
+            )),
+        }
+    }
+
+    fn build_candle_url(
+        api_base: &str,
+        db: &str,
+        pair: (&str, &str),
+        period: &str,
+        ts_start: i64,
+        ts_end: i64,
+    ) -> String {
+        format!(
+            "{base}/candles/{db}/{b}/{q}?period={period}&ts_start={ts_start}&ts_end={ts_end}",
+            base = api_base.trim_end_matches('/'),
+            b = pair.0,
+            q = pair.1,
+        )
+    }
+
+    fn build_request() -> Result<ChartRequest, JsValue> {
         let api_base = input_value("api-base")?;
         let db = select_value("db")?;
         let chart_source = select_value("chart-source")?;
@@ -1144,21 +1181,45 @@ mod web_app {
 
         let ts_start = datetime_local_to_unix_seconds(&ts_start_human)?;
         let ts_end = datetime_local_to_unix_seconds(&ts_end_human)?;
+        let (num, den) = chart_source_pairs(&chart_source)?;
 
-        let base = api_base.trim_end_matches('/');
-        let (asset_base, asset_quote) = match chart_source.as_str() {
-            "btc_usd" => ("btc", "usd"),
-            "eth_usd" => ("eth", "usd"),
-            "sol_usd" => ("sol", "usd"),
-            _ => {
-                return Err(JsValue::from_str(
-                    "chart-source must be btc_usd, eth_usd, or sol_usd",
-                ))
+        let num_url = build_candle_url(&api_base, &db, num, &period, ts_start, ts_end);
+        match den {
+            None => Ok(ChartRequest::Direct(num_url)),
+            Some(den_pair) => {
+                let den_url =
+                    build_candle_url(&api_base, &db, den_pair, &period, ts_start, ts_end);
+                Ok(ChartRequest::Ratio { num_url, den_url })
             }
-        };
-        Ok(format!(
-            "{base}/candles/{db}/{asset_base}/{asset_quote}?period={period}&ts_start={ts_start}&ts_end={ts_end}"
-        ))
+        }
+    }
+
+    fn compute_ratio_candles(num: &[Candle], den: &[Candle]) -> Vec<Candle> {
+        let mut out = Vec::with_capacity(num.len().min(den.len()));
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < num.len() && j < den.len() {
+            let n = &num[i];
+            let d = &den[j];
+            if n.timestamp < d.timestamp {
+                i += 1;
+            } else if n.timestamp > d.timestamp {
+                j += 1;
+            } else {
+                if d.open > 0.0 && d.close > 0.0 && d.high > 0.0 && d.low > 0.0 {
+                    out.push(Candle {
+                        timestamp: n.timestamp,
+                        open: n.open / d.open,
+                        close: n.close / d.close,
+                        high: n.high / d.low,
+                        low: n.low / d.high,
+                        volume: 0.0,
+                    });
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+        out
     }
 
     fn build_websocket_url(db: &str) -> Result<String, JsValue> {
@@ -2301,31 +2362,60 @@ mod web_app {
         Ok(())
     }
 
+    async fn fetch_candles(url: &str) -> Result<Vec<Candle>, JsValue> {
+        let resp = Request::get(url)
+            .send()
+            .await
+            .map_err(|e| JsValue::from_str(&format!("request failed: {e}")))?;
+        if !resp.ok() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(JsValue::from_str(&format!(
+                "API error {}: {}",
+                resp.status(),
+                body
+            )));
+        }
+        resp.json::<Vec<Candle>>()
+            .await
+            .map_err(|e| JsValue::from_str(&format!("invalid JSON response: {e}")))
+    }
+
     async fn fetch_and_draw() -> Result<(), JsValue> {
         let started_at = Date::now();
         save_inputs()?;
-        let url = build_url()?;
+        let request = build_request()?;
         let log_scale = checkbox_checked("log-scale")?;
         let ma_configs = moving_average_configs()?;
         set_status("Loading candles...");
 
         let request_started_at = Date::now();
-        let resp = Request::get(&url)
-            .send()
-            .await
-            .map_err(|e| JsValue::from_str(&format!("request failed: {e}")))?;
+        let candles = match request {
+            ChartRequest::Direct(url) => match fetch_candles(&url).await {
+                Ok(candles) => candles,
+                Err(err) => {
+                    set_status(&err.as_string().unwrap_or_else(|| "request failed".into()));
+                    return Ok(());
+                }
+            },
+            ChartRequest::Ratio { num_url, den_url } => {
+                let num = match fetch_candles(&num_url).await {
+                    Ok(c) => c,
+                    Err(err) => {
+                        set_status(&err.as_string().unwrap_or_else(|| "request failed".into()));
+                        return Ok(());
+                    }
+                };
+                let den = match fetch_candles(&den_url).await {
+                    Ok(c) => c,
+                    Err(err) => {
+                        set_status(&err.as_string().unwrap_or_else(|| "request failed".into()));
+                        return Ok(());
+                    }
+                };
+                compute_ratio_candles(&num, &den)
+            }
+        };
         let request_ms = Date::now() - request_started_at;
-
-        if !resp.ok() {
-            let body = resp.text().await.unwrap_or_default();
-            set_status(&format!("API error {}: {}", resp.status(), body));
-            return Ok(());
-        }
-
-        let candles = resp
-            .json::<Vec<Candle>>()
-            .await
-            .map_err(|e| JsValue::from_str(&format!("invalid JSON response: {e}")))?;
 
         LAST_CANDLES.with(|state| {
             *state.borrow_mut() = candles.clone();

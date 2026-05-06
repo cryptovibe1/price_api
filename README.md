@@ -155,8 +155,53 @@ docker exec -i docker-pg_duckdb-1 psql -U postgres postgres < init_sol_usd.sql
 REALTIME_SYMBOL=SOLUSDT REALTIME_BOOTSTRAP_START_TS=1586390400 cargo run -p price-api-server --bin price-api-worker
 ```
 
+## Gold
+#### Init xau sql
+```
+docker exec -i docker-postgres_18-1 psql -U postgres postgres < init_xau_usd.sql
+docker exec -i docker-timescaledb-1 psql -U postgres postgres < init_xau_usd.sql
+docker exec -i docker-pg_clickhouse-1 psql -U postgres postgres < init_xau_usd.sql
+docker exec -i docker-pg_duckdb-1 psql -U postgres postgres < init_xau_usd.sql
+```
+
+### Download XAU from kaggle
+```
+https://www.kaggle.com/datasets/novandraanugrah/xauusd-gold-price-historical-data-2004-2024?resource=download&select=XAU_1m_data.csv
+```
+
+#### Import CSV into xau_usd
+```
+./import_xauusd_csv.sh
+```
+
+The importer reads `XAU_1m_data.csv`, converts `Date` from `YYYY.MM.DD HH:MM` to Unix seconds, maps semicolon-delimited columns into `xau_usd`, and skips rows already present in each target table. To import into one database only:
+```
+PG_CONTAINER=docker-postgres_18-1 ./import_xauusd_csv.sh
+PG_CONTAINER=docker-timescaledb-1 ./import_xauusd_csv.sh
+PG_CONTAINER=docker-pg_clickhouse-1 ./import_xauusd_csv.sh
+PG_CONTAINER=docker-pg_duckdb-1 ./import_xauusd_csv.sh
+```
+
+#### Pull xau data from Binance
+```
+REALTIME_SYMBOL=XAUTUSDT cargo run -p price-api-server --bin price-api-worker
+```
+
+#### Fix known xau data gaps
+```
+./fix-xau-gaps
+```
+
+This pulls `XAUTUSDT` 1-minute candles from Binance for the known missing UTC date ranges `2025-09-11..2025-10-14`, `2026-01-13..2026-01-22`, and `2026-01-30..2026-03-26`, then inserts them into `xau_usd` in all four databases with `ON CONFLICT DO NOTHING`. To fix one database only:
+```
+PG_CONTAINER=docker-postgres_18-1 ./fix-xau-gaps
+PG_CONTAINER=docker-timescaledb-1 ./fix-xau-gaps
+PG_CONTAINER=docker-pg_clickhouse-1 ./fix-xau-gaps
+PG_CONTAINER=docker-pg_duckdb-1 ./fix-xau-gaps
+```
+
 #### Pull all supported Binance symbols
-If `REALTIME_SYMBOL` is not set, the worker starts pullers for all currently supported pairs: `BTCUSDT`, `ETHUSDT`, and `SOLUSDT`.
+If `REALTIME_SYMBOL` is not set, the worker starts pullers for all currently supported pairs: `BTCUSDT`, `ETHUSDT`, `SOLUSDT`, and `XAUTUSDT`.
 ```
 cargo run -p price-api-server --bin price-api-worker
 ```

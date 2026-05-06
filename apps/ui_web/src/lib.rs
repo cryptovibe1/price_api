@@ -1141,16 +1141,24 @@ mod web_app {
 
     fn chart_source_pairs(
         source: &str,
-    ) -> Result<((&'static str, &'static str), Option<(&'static str, &'static str)>), JsValue> {
+    ) -> Result<
+        (
+            (&'static str, &'static str),
+            Option<(&'static str, &'static str)>,
+        ),
+        JsValue,
+    > {
         match source {
             "btc_usd" => Ok((("btc", "usd"), None)),
             "eth_usd" => Ok((("eth", "usd"), None)),
             "sol_usd" => Ok((("sol", "usd"), None)),
+            "xau_usd" => Ok((("xau", "usd"), None)),
             "eth_btc" => Ok((("eth", "usd"), Some(("btc", "usd")))),
             "sol_btc" => Ok((("sol", "usd"), Some(("btc", "usd")))),
+            "btc_xau" => Ok((("btc", "usd"), Some(("xau", "usd")))),
             "sol_eth" => Ok((("sol", "usd"), Some(("eth", "usd")))),
             _ => Err(JsValue::from_str(
-                "chart-source must be btc_usd, eth_usd, sol_usd, eth_btc, sol_btc, or sol_eth",
+                "chart-source must be btc_usd, eth_usd, sol_usd, xau_usd, eth_btc, sol_btc, btc_xau, or sol_eth",
             )),
         }
     }
@@ -1187,8 +1195,7 @@ mod web_app {
         match den {
             None => Ok(ChartRequest::Direct(num_url)),
             Some(den_pair) => {
-                let den_url =
-                    build_candle_url(&api_base, &db, den_pair, &period, ts_start, ts_end);
+                let den_url = build_candle_url(&api_base, &db, den_pair, &period, ts_start, ts_end);
                 Ok(ChartRequest::Ratio { num_url, den_url })
             }
         }

@@ -4,6 +4,7 @@ btcusd_bitstamp_1min_latest.csv
 btcusd_bitstamp_1min_latest_patch.csv
 comprehensive-ethusd-1m-data.zip
 ETHUSD_1m_Coinbase.csv
+XAU_1m_data.csv
 target/
 Cargo.lock
 apps/ui_web/dist

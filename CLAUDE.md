@@ -48,7 +48,7 @@ Two binaries share the same library:
 - **`price-api-worker`** (`src/bin/worker.rs`) — Spawns one `spawn_realtime_workers` loop per `MarketPair`. Each loop polls Binance klines API, inserts new candles into all 4 DBs via `CandleRepository::insert_candles` with `ON CONFLICT DO NOTHING`.
 
 Key modules:
-- `models.rs` — `Candle`, `DbKind` (4 variants), `MarketPair` (3 pairs), `Period` (time aggregation parsing: `1min`..`1month`).
+- `models.rs` — `Candle`, `DbKind` (4 variants), `MarketPair` (4 pairs), `Period` (time aggregation parsing: `1min`..`1month`).
 - `db.rs` — `CandleRepository` wraps `PgPool`. `aggregation_sql()` generates GROUP BY bucket queries (integer division for sub-month, month-bucket CTE for months).
 - `exchange.rs` — `BinanceExchange` fetches from `api.binance.com/api/v3/klines`.
 - `config.rs` — `AppConfig::from_env()` reads env vars. DB connections use fixed ports mapped in `docker/pg.yaml`: Postgres=6432, DuckDB=6132, TimescaleDB=6332, ClickHouse=6232.
@@ -59,13 +59,13 @@ Single-file WASM app (`src/lib.rs`, ~1400 lines) using plotters-rs on HTML canva
 
 ### Database Schema
 
-Each asset pair has its own table (`btc_usd`, `eth_usd`, `sol_usd`) with identical schema: `(timestamp BIGINT PK, open, high, low, close, volume)`. All 4 DB engines use the same schema and are accessed via PostgreSQL wire protocol (sqlx).
+Each asset pair has its own table (`btc_usd`, `eth_usd`, `sol_usd`, `xau_usd`) with identical schema: `(timestamp BIGINT PK, open, high, low, close, volume)`. All 4 DB engines use the same schema and are accessed via PostgreSQL wire protocol (sqlx).
 
 ## Environment Variables
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `REALTIME_SYMBOL` | `BTCUSDT` | Worker: which Binance pair to pull (`BTCUSDT`, `ETHUSDT`, `SOLUSDT`). Omit to pull all. |
+| `REALTIME_SYMBOL` | `BTCUSDT` | Worker: which Binance pair to pull (`BTCUSDT`, `ETHUSDT`, `SOLUSDT`, `XAUTUSDT`). Omit to pull all. |
 | `REALTIME_BOOTSTRAP_START_TS` | auto | Worker: Unix timestamp to start backfill from |
 | `REALTIME_POLL_SECS` | `15` | Worker: poll interval seconds |
 | `REALTIME_FETCH_LIMIT` | `500` | Worker: Binance klines per request |

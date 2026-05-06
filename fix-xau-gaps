@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SYMBOL="${SYMBOL:-XAUTUSDT}"
+INTERVAL="${INTERVAL:-1m}"
+FETCH_LIMIT="${FETCH_LIMIT:-1000}"
+PG_USER="${PG_USER:-postgres}"
+PG_DB="${PG_DB:-postgres}"
+TABLE="${TABLE:-xau_usd}"
+
+if [[ -n "${PG_CONTAINER:-}" ]]; then
+  CONTAINERS=("$PG_CONTAINER")
+else
+  CONTAINERS=(
+    docker-postgres_18-1
+    docker-timescaledb-1
+    docker-pg_clickhouse-1
+    docker-pg_duckdb-1
+  )
+fi
+
+TMP_CSV="$(mktemp "${TMPDIR:-/tmp}/xau-gap-candles.XXXXXX.csv")"
+trap 'rm -f "$TMP_CSV"' EXIT
+
+python3 - "$TMP_CSV" "$SYMBOL" "$INTERVAL" "$FETCH_LIMIT" <<'PY'
+import csv
+import datetime as dt
+import json
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+output_file = sys.argv[1]
+symbol = sys.argv[2]
+interval = sys.argv[3]
+limit = int(sys.argv[4])
+
+# User-provided gap ranges. End dates are inclusive whole UTC days.
+gap_ranges = [
+    ("2025-09-11", "2025-10-14"),
+    ("2026-01-13", "2026-01-22"),
+    ("2026-01-30", "2026-03-26"),
+]
+
+api_url = "https://api.binance.com/api/v3/klines"
+one_minute_ms = 60 * 1000
+
+
+def parse_day(value):
+    return dt.datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc)
+
+
+def fetch_klines(start_ms, end_exclusive_ms):
+    cursor_ms = start_ms
+    while cursor_ms < end_exclusive_ms:
+        params = urllib.parse.urlencode(
+            {
+                "symbol": symbol,
+                "interval": interval,
+                "startTime": cursor_ms,
+                "endTime": end_exclusive_ms - 1,
+                "limit": limit,
+            }
+        )
+        request = urllib.request.Request(f"{api_url}?{params}")
+        with urllib.request.urlopen(request, timeout=30) as response:
+            rows = json.loads(response.read().decode("utf-8"))
+
+        if not rows:
+            break
+
+        for row in rows:
+            open_time_ms = int(row[0])
+            if open_time_ms >= end_exclusive_ms:
+                return
+            yield row
+
+        next_cursor_ms = int(rows[-1][0]) + one_minute_ms
+        if next_cursor_ms <= cursor_ms:
+            raise RuntimeError("Binance kline cursor did not advance")
+        cursor_ms = next_cursor_ms
+
+        # Keep the script polite when filling multi-week gaps.
+        time.sleep(0.08)
+
+
+seen_timestamps = set()
+written = 0
+
+with open(output_file, "w", newline="") as fh:
+    writer = csv.writer(fh, lineterminator="\n")
+    writer.writerow(["timestamp", "open", "high", "low", "close", "volume"])
+
+    for start_day, end_day in gap_ranges:
+        start_ms = int(parse_day(start_day).timestamp() * 1000)
+        end_exclusive_ms = int((parse_day(end_day) + dt.timedelta(days=1)).timestamp() * 1000)
+        print(
+            f"fetching {symbol} {interval} {start_day}..{end_day}",
+            file=sys.stderr,
+        )
+
+        for row in fetch_klines(start_ms, end_exclusive_ms):
+            timestamp = int(row[0]) // 1000
+            if timestamp in seen_timestamps:
+                continue
+            seen_timestamps.add(timestamp)
+            writer.writerow([timestamp, row[1], row[2], row[3], row[4], row[5]])
+            written += 1
+
+print(f"wrote {written} candles to {output_file}", file=sys.stderr)
+PY
+
+for container in "${CONTAINERS[@]}"; do
+  echo "loading gap candles into $container:$TABLE" >&2
+  {
+    printf 'BEGIN;\n'
+    printf 'CREATE TEMP TABLE xau_usd_gap_import (LIKE %s INCLUDING DEFAULTS) ON COMMIT DROP;\n' "$TABLE"
+    printf 'COPY xau_usd_gap_import (timestamp, open, high, low, close, volume) FROM STDIN WITH (FORMAT CSV, HEADER);\n'
+    sed -n '1,$p' "$TMP_CSV"
+    printf '\\.\n'
+    printf 'INSERT INTO %s (timestamp, open, high, low, close, volume)\n' "$TABLE"
+    printf 'SELECT timestamp, open, high, low, close, volume FROM xau_usd_gap_import\n'
+    printf 'ON CONFLICT (timestamp) DO NOTHING;\n'
+    printf 'COMMIT;\n'
+  } | docker exec -i "$container" psql -U "$PG_USER" -d "$PG_DB"
+done

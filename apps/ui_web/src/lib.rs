@@ -51,6 +51,7 @@ mod web_app {
         static FIB_LEVEL_DRAG: RefCell<Option<FibLevelDrag>> = const { RefCell::new(None) };
         static FIB_PREVIEW_POINT: RefCell<Option<(i64, f64)>> = const { RefCell::new(None) };
         static MEASURE_DRAG_TS: RefCell<Option<i64>> = const { RefCell::new(None) };
+        static MEASURE_DRAG_PRICE: RefCell<Option<f64>> = const { RefCell::new(None) };
         static FIB_POPUP_DRAG: RefCell<Option<(f64, f64)>> = const { RefCell::new(None) };
         static MA_SETTINGS_DRAG: RefCell<Option<(f64, f64)>> = const { RefCell::new(None) };
         static CONNECTION_SETTINGS_DRAG: RefCell<Option<(f64, f64)>> = const { RefCell::new(None) };
@@ -95,7 +96,10 @@ mod web_app {
     }
 
     #[derive(Clone, Copy)]
-    struct FibLevelDrag;
+    enum FibLevelDrag {
+        AnchorA,
+        AnchorB,
+    }
 
     struct LiveWsConnection {
         ws: WebSocket,
@@ -119,8 +123,8 @@ mod web_app {
     #[derive(Clone, Copy)]
     struct MeasureState {
         enabled: bool,
-        anchor_a: Option<i64>,
-        anchor_b: Option<i64>,
+        anchor_a: Option<(i64, f64)>,
+        anchor_b: Option<(i64, f64)>,
     }
 
     impl MeasureState {
@@ -297,13 +301,13 @@ mod web_app {
         if enabled {
             button.set_class_name("toggle-btn active");
             button.set_attribute("aria-pressed", "true")?;
-            button.set_attribute("aria-label", "Measure On")?;
-            button.set_attribute("title", "Measure On")?;
+            button.set_attribute("aria-label", "Price Percent On")?;
+            button.set_attribute("title", "Price Percent On")?;
         } else {
             button.set_class_name("toggle-btn");
             button.set_attribute("aria-pressed", "false")?;
-            button.set_attribute("aria-label", "Measure Off")?;
-            button.set_attribute("title", "Measure Off")?;
+            button.set_attribute("aria-label", "Price Percent Off")?;
+            button.set_attribute("title", "Price Percent Off")?;
         }
 
         Ok(())
@@ -356,13 +360,32 @@ mod web_app {
     fn active_measure_range() -> Option<(i64, i64)> {
         MEASURE_STATE.with(|state| {
             let cfg = *state.borrow();
-            let start = cfg.anchor_a?;
-            let end = match (cfg.anchor_b, cfg.enabled) {
+            let (start, _) = cfg.anchor_a?;
+            let (end, _) = match (cfg.anchor_b, cfg.enabled) {
                 (Some(v), _) => v,
-                (None, true) => MEASURE_DRAG_TS.with(|drag| *drag.borrow())?,
+                (None, true) => (
+                    MEASURE_DRAG_TS.with(|drag| *drag.borrow())?,
+                    MEASURE_DRAG_PRICE.with(|drag| *drag.borrow())?,
+                ),
                 (None, false) => return None,
             };
             Some((start.min(end), start.max(end)))
+        })
+    }
+
+    fn active_measure_price_range() -> Option<(f64, f64)> {
+        MEASURE_STATE.with(|state| {
+            let cfg = *state.borrow();
+            let (_, start) = cfg.anchor_a?;
+            let (_, end) = match (cfg.anchor_b, cfg.enabled) {
+                (Some(v), _) => v,
+                (None, true) => (
+                    MEASURE_DRAG_TS.with(|drag| *drag.borrow())?,
+                    MEASURE_DRAG_PRICE.with(|drag| *drag.borrow())?,
+                ),
+                (None, false) => return None,
+            };
+            Some((start, end))
         })
     }
 
@@ -383,26 +406,43 @@ mod web_app {
         })
     }
 
-    fn finished_fib_primary_level_price() -> Option<f64> {
+    fn fib_level_drag_label(level: FibLevelDrag) -> &'static str {
+        match level {
+            FibLevelDrag::AnchorA => "Fib 1.0 (100%)",
+            FibLevelDrag::AnchorB => "Fib 0.0 (0%)",
+        }
+    }
+
+    fn finished_fib_level_price(level: FibLevelDrag) -> Option<f64> {
         FIB_STATE.with(|state| {
             let cfg = *state.borrow();
-            match (cfg.anchor_a, cfg.anchor_b) {
-                (Some((_, price)), Some(_)) => Some(price),
-                _ => None,
+            if cfg.anchor_b.is_none() {
+                return None;
+            }
+            match level {
+                FibLevelDrag::AnchorA => cfg.anchor_a.map(|(_, price)| price),
+                FibLevelDrag::AnchorB => cfg.anchor_b.map(|(_, price)| price),
             }
         })
     }
 
-    fn set_fib_primary_level_price(next_price: f64) -> bool {
+    fn set_fib_level_price(level: FibLevelDrag, next_price: f64) -> bool {
         FIB_STATE.with(|state| {
             let mut cfg = state.borrow_mut();
-            let Some((ts, current_price)) = cfg.anchor_a else {
-                return false;
-            };
-            if cfg.anchor_b.is_none() || (current_price - next_price).abs() < 0.01 {
+            if cfg.anchor_b.is_none() {
                 return false;
             }
-            cfg.anchor_a = Some((ts, next_price));
+            let target = match level {
+                FibLevelDrag::AnchorA => &mut cfg.anchor_a,
+                FibLevelDrag::AnchorB => &mut cfg.anchor_b,
+            };
+            let Some((ts, current_price)) = *target else {
+                return false;
+            };
+            if (current_price - next_price).abs() < 0.01 {
+                return false;
+            }
+            *target = Some((ts, next_price));
             true
         })
     }
@@ -437,14 +477,17 @@ mod web_app {
         })
     }
 
-    fn fib_primary_line_hit_test(offset_y: f64, plot_top: f64, plot_bottom: f64) -> bool {
-        let Some(line_price) = finished_fib_primary_level_price() else {
-            return false;
-        };
-        let Some(line_y) = canvas_y_from_price(line_price, plot_top, plot_bottom) else {
-            return false;
-        };
-        (offset_y - line_y).abs() <= 8.0
+    fn fib_level_hit_test(offset_y: f64, plot_top: f64, plot_bottom: f64) -> Option<FibLevelDrag> {
+        [FibLevelDrag::AnchorA, FibLevelDrag::AnchorB]
+            .into_iter()
+            .filter_map(|level| {
+                let line_price = finished_fib_level_price(level)?;
+                let line_y = canvas_y_from_price(line_price, plot_top, plot_bottom)?;
+                Some((level, (offset_y - line_y).abs()))
+            })
+            .filter(|(_, distance)| *distance <= 8.0)
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(level, _)| level)
     }
 
     fn redraw_visible_chart_only() -> Result<(), JsValue> {
@@ -1121,6 +1164,16 @@ mod web_app {
             format!("{:.6}", y)
         } else {
             "0".to_string()
+        }
+    }
+
+    fn format_measure_price_label(start: f64, end: f64) -> String {
+        let delta = end - start;
+        if start.abs() > f64::EPSILON && start.is_finite() && end.is_finite() {
+            let percent = (end / start - 1.0) * 100.0;
+            format!("{} ({:+.2}%)", format_price_label(delta), percent)
+        } else {
+            format_price_label(delta)
         }
     }
 
@@ -1911,6 +1964,7 @@ mod web_app {
         };
         let fib_overlay = active_fib_overlay();
         let measure_range = active_measure_range();
+        let measure_price_range = active_measure_price_range();
 
         // Keep autoscaling tied to market data so Fib extensions don't flatten the chart.
         let y_min_linear = raw_y_min;
@@ -1987,6 +2041,8 @@ mod web_app {
             })
             .unwrap_or((x_start, x_start, x_start));
         let measure_label = measure_range.map(|(start, end)| format_duration_human(end - start));
+        let measure_price_label =
+            measure_price_range.map(|(start, end)| format_measure_price_label(start, end));
 
         if use_log_scale {
             let mut chart = ChartBuilder::on(&root)
@@ -2136,6 +2192,47 @@ mod web_app {
                     )))
                     .map_err(|e| JsValue::from_str(&format!("measure label draw error: {e}")))?;
             }
+
+            if let (Some((start_price, end_price)), Some(label)) =
+                (measure_price_range, &measure_price_label)
+            {
+                let low_price = start_price.min(end_price);
+                let high_price = start_price.max(end_price);
+                let label_y = if low_price > 0.0 && high_price > low_price {
+                    (low_price.ln() + (high_price.ln() - low_price.ln()) / 2.0).exp()
+                } else {
+                    (start_price + end_price) / 2.0
+                }
+                .clamp(y_low, y_high);
+                chart
+                    .draw_series([
+                        PathElement::new(
+                            vec![(measure_x_start, start_price), (measure_x_end, start_price)],
+                            RGBColor(42, 54, 80).mix(0.25),
+                        ),
+                        PathElement::new(
+                            vec![(measure_x_start, end_price), (measure_x_end, end_price)],
+                            RGBColor(42, 54, 80).mix(0.25),
+                        ),
+                        PathElement::new(
+                            vec![(measure_x_end, start_price), (measure_x_end, end_price)],
+                            RGBColor(42, 54, 80),
+                        ),
+                    ])
+                    .map_err(|e| JsValue::from_str(&format!("measure price draw error: {e}")))?;
+                chart
+                    .draw_series(std::iter::once(Text::new(
+                        label.clone(),
+                        (measure_x_end, label_y),
+                        ("sans-serif", 12)
+                            .into_font()
+                            .color(&RGBColor(42, 54, 80))
+                            .pos(Pos::new(HPos::Left, VPos::Center)),
+                    )))
+                    .map_err(|e| {
+                        JsValue::from_str(&format!("measure price label draw error: {e}"))
+                    })?;
+            }
         } else {
             let mut chart = ChartBuilder::on(&root)
                 .margin(16)
@@ -2279,6 +2376,40 @@ mod web_app {
                         ("sans-serif", 12).into_font().color(&RGBColor(42, 54, 80)),
                     )))
                     .map_err(|e| JsValue::from_str(&format!("measure label draw error: {e}")))?;
+            }
+
+            if let (Some((start_price, end_price)), Some(label)) =
+                (measure_price_range, &measure_price_label)
+            {
+                let label_y = ((start_price + end_price) / 2.0).clamp(y_low, y_high);
+                chart
+                    .draw_series([
+                        PathElement::new(
+                            vec![(measure_x_start, start_price), (measure_x_end, start_price)],
+                            RGBColor(42, 54, 80).mix(0.25),
+                        ),
+                        PathElement::new(
+                            vec![(measure_x_start, end_price), (measure_x_end, end_price)],
+                            RGBColor(42, 54, 80).mix(0.25),
+                        ),
+                        PathElement::new(
+                            vec![(measure_x_end, start_price), (measure_x_end, end_price)],
+                            RGBColor(42, 54, 80),
+                        ),
+                    ])
+                    .map_err(|e| JsValue::from_str(&format!("measure price draw error: {e}")))?;
+                chart
+                    .draw_series(std::iter::once(Text::new(
+                        label.clone(),
+                        (measure_x_end, label_y),
+                        ("sans-serif", 12)
+                            .into_font()
+                            .color(&RGBColor(42, 54, 80))
+                            .pos(Pos::new(HPos::Left, VPos::Center)),
+                    )))
+                    .map_err(|e| {
+                        JsValue::from_str(&format!("measure price label draw error: {e}"))
+                    })?;
             }
         }
 
@@ -2751,6 +2882,9 @@ mod web_app {
                 MEASURE_DRAG_TS.with(|state| {
                     *state.borrow_mut() = None;
                 });
+                MEASURE_DRAG_PRICE.with(|state| {
+                    *state.borrow_mut() = None;
+                });
                 let _ = set_fib_preview_point(None);
                 if let Err(err) = sync_fib_button() {
                     set_status(&format!("failed: {:?}", err));
@@ -2791,6 +2925,9 @@ mod web_app {
             MEASURE_DRAG_TS.with(|state| {
                 *state.borrow_mut() = None;
             });
+            MEASURE_DRAG_PRICE.with(|state| {
+                *state.borrow_mut() = None;
+            });
             if next_enabled {
                 FIB_STATE.with(|state| {
                     state.borrow_mut().enabled = false;
@@ -2807,10 +2944,10 @@ mod web_app {
                     set_status(&format!("failed: {:?}", err));
                     return;
                 }
-                set_status("Measure tool enabled");
-                set_hover_info("Measure: click A on chart, drag to B on X-axis");
+                set_status("Price % tool enabled");
+                set_hover_info("Price %: click A on chart, drag to B");
             } else {
-                set_status("Measure tool disabled");
+                set_status("Price % tool disabled");
             }
             if let Err(err) = sync_measure_button() {
                 set_status(&format!("failed: {:?}", err));
@@ -2844,6 +2981,9 @@ mod web_app {
                     cfg.anchor_b = None;
                 });
                 MEASURE_DRAG_TS.with(|state| {
+                    *state.borrow_mut() = None;
+                });
+                MEASURE_DRAG_PRICE.with(|state| {
                     *state.borrow_mut() = None;
                 });
                 if let Err(err) = sync_drag_button() {
@@ -3190,13 +3330,20 @@ mod web_app {
             FIB_POPUP_DRAG.with(|state| {
                 *state.borrow_mut() = None;
             });
-            CHART_DRAG.with(|state| {
-                *state.borrow_mut() = None;
-            });
+            let chart_drag_finished = CHART_DRAG.with(|state| state.borrow_mut().take().is_some());
             Y_STRETCH_DRAG.with(|state| {
                 *state.borrow_mut() = None;
             });
-            if DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
+            if chart_drag_finished && DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
+                DRAG_TOOL_ENABLED.with(|state| {
+                    *state.borrow_mut() = false;
+                });
+                if let Err(err) = sync_drag_button() {
+                    set_status(&format!("failed: {:?}", err));
+                } else {
+                    set_status("Drag tool disabled after pan");
+                }
+            } else if DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
                 set_chart_cursor("move");
             } else {
                 set_chart_cursor("default");
@@ -3291,7 +3438,7 @@ mod web_app {
                     return;
                 }
 
-                if FIB_LEVEL_DRAG.with(|state| state.borrow().is_some()) {
+                if let Some(drag_level) = FIB_LEVEL_DRAG.with(|state| *state.borrow()) {
                     let dragged_price =
                         price_from_canvas_y(event.offset_y() as f64, plot_top, plot_bottom);
                     if let Some(price) = dragged_price {
@@ -3300,13 +3447,14 @@ mod web_app {
                             canvas_left + plot_left,
                             canvas_left + plot_right,
                         );
-                        if set_fib_primary_level_price(price) {
+                        if set_fib_level_price(drag_level, price) {
                             if let Err(err) = redraw_visible_chart_only() {
                                 set_status(&format!("failed: {:?}", err));
                             }
                         }
-                        set_status(&format!("Fib 1.0 moved to {:.2}", price));
-                        set_fib_popup_info(&format!("Dragging Fib 1.0 (100%) to {:.2}", price));
+                        let label = fib_level_drag_label(drag_level);
+                        set_status(&format!("{label} moved to {:.2}", price));
+                        set_fib_popup_info(&format!("Dragging {label} to {:.2}", price));
                     } else {
                         hide_cursor_hline();
                     }
@@ -3321,32 +3469,40 @@ mod web_app {
                 let measure_enabled = MEASURE_STATE.with(|state| state.borrow().enabled);
                 let measure_anchor_a = MEASURE_STATE.with(|state| state.borrow().anchor_a);
                 if measure_enabled && measure_anchor_a.is_some() {
-                    if let Some(cursor_ts) =
-                        timestamp_from_canvas_x(canvas_width, canvas_height, crosshair_x as f64)
-                    {
-                        let changed = MEASURE_DRAG_TS.with(|state| {
-                            let mut drag_ts = state.borrow_mut();
-                            if *drag_ts == Some(cursor_ts) {
-                                false
-                            } else {
-                                *drag_ts = Some(cursor_ts);
-                                true
-                            }
-                        });
+                    if let (Some(cursor_ts), Some(cursor_price)) = (
+                        timestamp_from_canvas_x(canvas_width, canvas_height, crosshair_x as f64),
+                        price_from_canvas_y(crosshair_y as f64, plot_top, plot_bottom),
+                    ) {
+                        let previous_ts = MEASURE_DRAG_TS.with(|state| *state.borrow());
+                        let previous_price = MEASURE_DRAG_PRICE.with(|state| *state.borrow());
+                        let changed = previous_ts != Some(cursor_ts)
+                            || previous_price
+                                .map(|price| (price - cursor_price).abs() > f64::EPSILON)
+                                .unwrap_or(true);
+                        if changed {
+                            MEASURE_DRAG_TS.with(|state| {
+                                *state.borrow_mut() = Some(cursor_ts);
+                            });
+                            MEASURE_DRAG_PRICE.with(|state| {
+                                *state.borrow_mut() = Some(cursor_price);
+                            });
+                        }
                         if changed {
                             if let Err(err) = redraw_visible_chart_only() {
                                 set_status(&format!("failed: {:?}", err));
                             }
                         }
-                        if let Some(start_ts) = measure_anchor_a {
+                        if let Some((start_ts, start_price)) = measure_anchor_a {
                             let label = format_duration_human(cursor_ts - start_ts);
+                            let price_label = format_measure_price_label(start_price, cursor_price);
                             set_status(&format!(
-                                "Measure: {} -> {} ({})",
+                                "Price %: {} -> {} ({}) | price {}",
                                 unix_seconds_to_hover_text(start_ts),
                                 unix_seconds_to_hover_text(cursor_ts),
-                                label
+                                label,
+                                price_label
                             ));
-                            set_hover_info(&format!("Measure period: {label}"));
+                            set_hover_info(&format!("Price %: {label} | price {price_label}"));
                         }
                     }
                     hide_hover_tooltip();
@@ -3461,10 +3617,15 @@ mod web_app {
                     }
                 };
 
-                let fib_line_hover = !event.shift_key()
+                let fib_hover_level = if !event.shift_key()
                     && !measure_enabled
                     && !DRAG_TOOL_ENABLED.with(|state| *state.borrow())
-                    && fib_primary_line_hit_test(crosshair_y as f64, plot_top, plot_bottom);
+                {
+                    fib_level_hit_test(crosshair_y as f64, plot_top, plot_bottom)
+                } else {
+                    None
+                };
+                let fib_line_hover = fib_hover_level.is_some();
                 if fib_line_hover {
                     set_chart_cursor("ns-resize");
                 } else if DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
@@ -3482,8 +3643,12 @@ mod web_app {
                 };
                 let label_text = format!("{} | USD {:.2}", text, usd_price);
                 let fib_text = fib_popup_text_for_cursor(cursor_ts, usd_price);
-                let fib_popup_text = if fib_line_hover {
-                    format!("Drag Fib 1.0 (100%) line. Cursor price {:.2}", usd_price)
+                let fib_popup_text = if let Some(level) = fib_hover_level {
+                    format!(
+                        "Drag {} line. Cursor price {:.2}",
+                        fib_level_drag_label(level),
+                        usd_price
+                    )
                 } else {
                     fib_text
                 };
@@ -3536,22 +3701,31 @@ mod web_app {
 
             if MEASURE_STATE.with(|state| state.borrow().enabled) && !event.shift_key() {
                 let crosshair_x = (event.offset_x() as f64).clamp(plot_left, plot_right);
+                let crosshair_y = (event.offset_y() as f64).clamp(plot_top, plot_bottom);
                 let cursor_ts =
                     match timestamp_from_canvas_x(canvas_width, canvas_height, crosshair_x) {
                         Some(v) => v,
                         None => return,
                     };
+                let cursor_price = match price_from_canvas_y(crosshair_y, plot_top, plot_bottom) {
+                    Some(v) => v,
+                    None => return,
+                };
                 MEASURE_STATE.with(|state| {
                     let mut cfg = state.borrow_mut();
-                    cfg.anchor_a = Some(cursor_ts);
+                    cfg.anchor_a = Some((cursor_ts, cursor_price));
                     cfg.anchor_b = None;
                 });
                 MEASURE_DRAG_TS.with(|state| {
                     *state.borrow_mut() = Some(cursor_ts);
                 });
+                MEASURE_DRAG_PRICE.with(|state| {
+                    *state.borrow_mut() = Some(cursor_price);
+                });
                 set_status(&format!(
-                    "Measure start: {}. Drag to end point.",
-                    unix_seconds_to_hover_text(cursor_ts)
+                    "Price % start: {} @ {}. Drag to end point.",
+                    unix_seconds_to_hover_text(cursor_ts),
+                    format_price_label(cursor_price)
                 ));
                 if let Err(err) = redraw_visible_chart_only() {
                     set_status(&format!("failed: {:?}", err));
@@ -3560,16 +3734,20 @@ mod web_app {
             }
 
             let offset_y = event.offset_y() as f64;
-            if !event.shift_key()
-                && !DRAG_TOOL_ENABLED.with(|state| *state.borrow())
-                && fib_primary_line_hit_test(offset_y, plot_top, plot_bottom)
-            {
+            let fib_drag_level =
+                if !event.shift_key() && !DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
+                    fib_level_hit_test(offset_y, plot_top, plot_bottom)
+                } else {
+                    None
+                };
+            if let Some(level) = fib_drag_level {
                 FIB_LEVEL_DRAG.with(|state| {
-                    *state.borrow_mut() = Some(FibLevelDrag);
+                    *state.borrow_mut() = Some(level);
                 });
+                let label = fib_level_drag_label(level);
                 set_chart_cursor("ns-resize");
-                set_status("Dragging Fib 1.0 (100%) line");
-                set_fib_popup_info("Drag Fib 1.0 (100%) line to reposition it.");
+                set_status(&format!("Dragging {label} line"));
+                set_fib_popup_info(&format!("Drag {label} line to reposition it."));
                 return;
             }
 
@@ -3707,48 +3885,60 @@ mod web_app {
                     *state.borrow_mut() = 0.0;
                 });
             }
-            CHART_DRAG.with(|state| {
-                *state.borrow_mut() = None;
-            });
-            let fib_line_drag_finished =
-                FIB_LEVEL_DRAG.with(|state| state.borrow_mut().take().is_some());
+            let chart_drag_finished = CHART_DRAG.with(|state| state.borrow_mut().take().is_some());
+            let fib_line_drag_finished = FIB_LEVEL_DRAG.with(|state| state.borrow_mut().take());
             Y_STRETCH_DRAG.with(|state| {
                 *state.borrow_mut() = None;
             });
             let measure_finished = MEASURE_STATE.with(|state| {
                 let mut cfg = state.borrow_mut();
                 if cfg.enabled {
-                    if let Some(end_ts) = MEASURE_DRAG_TS.with(|drag| *drag.borrow()) {
-                        if let Some(start_ts) = cfg.anchor_a {
-                            cfg.anchor_b = Some(end_ts);
+                    if let (Some(end_ts), Some(end_price)) = (
+                        MEASURE_DRAG_TS.with(|drag| *drag.borrow()),
+                        MEASURE_DRAG_PRICE.with(|drag| *drag.borrow()),
+                    ) {
+                        if let Some((start_ts, start_price)) = cfg.anchor_a {
+                            cfg.anchor_b = Some((end_ts, end_price));
                             cfg.enabled = false;
-                            return Some((start_ts, end_ts));
+                            return Some((start_ts, start_price, end_ts, end_price));
                         }
                     }
                 }
                 None
             });
-            if let Some((start_ts, end_ts)) = measure_finished {
+            if let Some((start_ts, start_price, end_ts, end_price)) = measure_finished {
                 if let Err(err) = sync_measure_button() {
                     set_status(&format!("failed: {:?}", err));
                     return;
                 }
                 let label = format_duration_human(end_ts - start_ts);
+                let price_label = format_measure_price_label(start_price, end_price);
                 set_status(&format!(
-                    "Measured: {} -> {} ({})",
+                    "Price % measured: {} -> {} ({}) | price {}",
                     unix_seconds_to_hover_text(start_ts),
                     unix_seconds_to_hover_text(end_ts),
-                    label
+                    label,
+                    price_label
                 ));
-                set_hover_info(&format!("Measure period: {label}"));
+                set_hover_info(&format!("Price %: {label} | price {price_label}"));
             }
-            if DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
+            if chart_drag_finished && DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
+                DRAG_TOOL_ENABLED.with(|state| {
+                    *state.borrow_mut() = false;
+                });
+                if let Err(err) = sync_drag_button() {
+                    set_status(&format!("failed: {:?}", err));
+                    return;
+                }
+                set_status("Drag tool disabled after pan");
+            } else if DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
                 set_chart_cursor("move");
-            } else if fib_line_drag_finished {
+            } else if let Some(level) = fib_line_drag_finished {
                 set_chart_cursor("default");
-                if let Some(price) = finished_fib_primary_level_price() {
-                    set_status(&format!("Fib 1.0 fixed at {:.2}", price));
-                    set_fib_popup_info(&format!("Fib 1.0 (100%) moved to {:.2}", price));
+                if let Some(price) = finished_fib_level_price(level) {
+                    let label = fib_level_drag_label(level);
+                    set_status(&format!("{label} fixed at {:.2}", price));
+                    set_fib_popup_info(&format!("{label} moved to {:.2}", price));
                 }
             } else {
                 set_chart_cursor("default");

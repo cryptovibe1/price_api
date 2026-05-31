@@ -70,6 +70,9 @@ mod web_app {
     const STORAGE_KEY_SETTINGS_SIDE: &str = "price_api.settings_side";
     const STORAGE_KEY_CONNECTION_SETTINGS_VISIBLE: &str = "price_api.connection_settings_visible";
     const STORAGE_KEY_CONNECTION_SETTINGS_SIDE: &str = "price_api.connection_settings_side";
+    const STORAGE_KEY_VIEW_START: &str = "price_api.view_start";
+    const STORAGE_KEY_VIEW_END: &str = "price_api.view_end";
+    const STORAGE_KEY_VIEW_PERIOD: &str = "price_api.view_period";
     const MA_COUNT: usize = 15;
 
     #[derive(Clone, Copy)]
@@ -310,6 +313,34 @@ mod web_app {
             button.set_attribute("title", "Price Percent Off")?;
         }
 
+        Ok(())
+    }
+
+    // Turn off the interactive chart tools (Drag, Price %, Fib) and reset their
+    // in-progress state. Used by the Escape key to cancel whatever is active.
+    fn cancel_active_tools() -> Result<(), JsValue> {
+        DRAG_TOOL_ENABLED.with(|state| {
+            *state.borrow_mut() = false;
+        });
+        MEASURE_STATE.with(|state| {
+            let mut cfg = state.borrow_mut();
+            cfg.enabled = false;
+            cfg.anchor_a = None;
+            cfg.anchor_b = None;
+        });
+        MEASURE_DRAG_TS.with(|state| {
+            *state.borrow_mut() = None;
+        });
+        MEASURE_DRAG_PRICE.with(|state| {
+            *state.borrow_mut() = None;
+        });
+        FIB_STATE.with(|state| {
+            state.borrow_mut().enabled = false;
+        });
+        let _ = set_fib_preview_point(None);
+        sync_drag_button()?;
+        sync_measure_button()?;
+        sync_fib_button()?;
         Ok(())
     }
 
@@ -1615,6 +1646,40 @@ mod web_app {
         (ts_start + shift, ts_end + shift)
     }
 
+    fn save_view_range(ts_start: i64, ts_end: i64) {
+        let Ok(storage) = storage() else {
+            return;
+        };
+        let Ok(period) = input_value("period") else {
+            return;
+        };
+        let _ = storage.set_item(STORAGE_KEY_VIEW_START, &ts_start.to_string());
+        let _ = storage.set_item(STORAGE_KEY_VIEW_END, &ts_end.to_string());
+        let _ = storage.set_item(STORAGE_KEY_VIEW_PERIOD, &period);
+    }
+
+    // Returns the persisted zoom/pan view range only when it was saved for the
+    // currently selected period (timeframe), so a reload keeps the same view.
+    fn saved_view_range_for_current_period() -> Option<(i64, i64)> {
+        let storage = storage().ok()?;
+        let saved_period = storage.get_item(STORAGE_KEY_VIEW_PERIOD).ok()??;
+        let current_period = input_value("period").ok()?;
+        if saved_period != current_period {
+            return None;
+        }
+        let start = storage
+            .get_item(STORAGE_KEY_VIEW_START)
+            .ok()??
+            .parse::<i64>()
+            .ok()?;
+        let end = storage
+            .get_item(STORAGE_KEY_VIEW_END)
+            .ok()??
+            .parse::<i64>()
+            .ok()?;
+        Some((start, end))
+    }
+
     fn rendered_range() -> Option<(i64, i64)> {
         CLIENT_VIEW_RANGE.with(|state| *state.borrow()).or_else(|| {
             LAST_RENDERED_CANDLES.with(|state| {
@@ -1725,6 +1790,7 @@ mod web_app {
         CLIENT_VIEW_RANGE.with(|state| {
             *state.borrow_mut() = Some((new_start, new_end));
         });
+        save_view_range(new_start, new_end);
 
         let candles = LAST_CANDLES.with(|state| state.borrow().clone());
         if candles.is_empty() {
@@ -2490,6 +2556,7 @@ mod web_app {
         CLIENT_VIEW_RANGE.with(|state| {
             *state.borrow_mut() = Some((ts_start, ts_end));
         });
+        save_view_range(ts_start, ts_end);
         let visible = filter_candles_by_range(&candles, ts_start, ts_end);
 
         draw(&visible, log_scale, &ma_configs)?;
@@ -2558,15 +2625,22 @@ mod web_app {
         LAST_CANDLES.with(|state| {
             *state.borrow_mut() = candles.clone();
         });
-        let (view_start, view_end) = candle_bounds(&candles)
+        let full_bounds = candle_bounds(&candles)
             .map(|(start, end)| (start, (start + 60).max(end)))
             .unwrap_or_else(|| {
                 let now_secs = (Date::now() / 1000.0) as i64;
                 (now_secs.saturating_sub(60), now_secs)
             });
+        // Keep the previous zoom/pan view across reloads when the timeframe
+        // (period) is unchanged; otherwise show the full loaded range.
+        let (view_start, view_end) = match saved_view_range_for_current_period() {
+            Some((s, e)) => clamp_range_to_loaded(s, e),
+            None => full_bounds,
+        };
         CLIENT_VIEW_RANGE.with(|state| {
             *state.borrow_mut() = Some((view_start, view_end));
         });
+        save_view_range(view_start, view_end);
         let visible = filter_candles_by_range(&candles, view_start, view_end);
         draw(&visible, log_scale, &ma_configs)?;
         let total_ms = Date::now() - started_at;
@@ -2787,8 +2861,12 @@ mod web_app {
             if event.key() == "Escape" {
                 event.prevent_default();
                 clear_fib_levels();
-                set_status("Fib levels cleared");
-                set_fib_popup_info("Fib anchors cleared. Click first point.");
+                if let Err(err) = cancel_active_tools() {
+                    set_status(&format!("failed: {:?}", err));
+                    return;
+                }
+                set_status("Tools cancelled (Drag, Price %, Fib off)");
+                set_fib_popup_info("Tools cancelled. Click Fib to start again.");
                 spawn_local(async {
                     if let Err(err) = rerender_cached_or_fetch().await {
                         set_status(&format!("failed: {:?}", err));

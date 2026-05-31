@@ -1475,6 +1475,26 @@ mod web_app {
         points
     }
 
+    /// Keep only the moving-average points needed to draw the line across the
+    /// visible window: everything inside `[x_start, x_end]` plus the single
+    /// point just outside each edge so the line still reaches the borders.
+    fn clip_points_to_range(points: Vec<(i64, f64)>, x_start: i64, x_end: i64) -> Vec<(i64, f64)> {
+        if points.is_empty() {
+            return points;
+        }
+        let first_inside = points.iter().position(|(ts, _)| *ts >= x_start);
+        let last_inside = points.iter().rposition(|(ts, _)| *ts <= x_end);
+        let (Some(first_inside), Some(last_inside)) = (first_inside, last_inside) else {
+            return Vec::new();
+        };
+        if first_inside > last_inside {
+            return Vec::new();
+        }
+        let lo = first_inside.saturating_sub(1);
+        let hi = (last_inside + 1).min(points.len() - 1);
+        points[lo..=hi].to_vec()
+    }
+
     fn rsi_points(candles: &[Candle], period: usize) -> Vec<(i64, f64)> {
         if candles.len() <= period {
             return Vec::new();
@@ -2078,10 +2098,25 @@ mod web_app {
                 use_log_scale,
             });
         });
+        // Compute moving averages over the full loaded dataset rather than the
+        // visible slice, then clip to the view. This keeps each MA line stable
+        // and continuous when zooming/panning instead of recomputing from
+        // scratch (and losing its warmup) at the left edge of the window.
+        let ma_full = LAST_CANDLES.with(|state| state.borrow().clone());
+        let ma_source: &[Candle] = if ma_full.len() >= candles.len() {
+            &ma_full
+        } else {
+            candles
+        };
         let ma_series: Vec<(RGBColor, Vec<(i64, f64)>)> = ma_configs
             .iter()
             .filter(|cfg| cfg.enabled)
-            .map(|cfg| (cfg.color, sma_points(candles, cfg.period)))
+            .map(|cfg| {
+                (
+                    cfg.color,
+                    clip_points_to_range(sma_points(ma_source, cfg.period), x_start, x_end),
+                )
+            })
             .filter(|(_, points)| !points.is_empty())
             .collect();
         let visible_fib_levels = visible_fib_levels(&fib_overlay, y_low, y_high, use_log_scale);

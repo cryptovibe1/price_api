@@ -1932,6 +1932,23 @@ mod web_app {
         Ok(())
     }
 
+    // Reset the zoom/pan view so every loaded candle fits on screen, on both
+    // axes: the x-axis (time) window spans all candles and the y-axis (price)
+    // vertical stretch/pan is reset to its autoscaled default.
+    fn auto_fit_view() -> Result<(), JsValue> {
+        let candles = LAST_CANDLES.with(|state| state.borrow().clone());
+        let Some((start, end)) = candle_bounds(&candles) else {
+            set_status("Load candles before auto fit");
+            return Ok(());
+        };
+        Y_STRETCH_FACTOR.with(|state| *state.borrow_mut() = 1.0);
+        Y_PAN_LINEAR_OFFSET.with(|state| *state.borrow_mut() = 0.0);
+        Y_PAN_LOG_OFFSET.with(|state| *state.borrow_mut() = 0.0);
+        apply_range_change_client_only(start, (start + 60).max(end))?;
+        set_status("View fit to all candles");
+        Ok(())
+    }
+
     fn plot_bounds(canvas_width: f64, canvas_height: f64) -> Option<(f64, f64, f64, f64)> {
         if canvas_width <= 0.0 || canvas_height <= 0.0 {
             return None;
@@ -2864,6 +2881,9 @@ mod web_app {
         let line_clear_button = doc
             .get_element_by_id("line-clear")
             .ok_or_else(|| JsValue::from_str("missing line clear button"))?;
+        let auto_fit_button = doc
+            .get_element_by_id("auto-fit")
+            .ok_or_else(|| JsValue::from_str("missing auto fit button"))?;
         let fib_popup = doc
             .get_element_by_id("fib-popup")
             .ok_or_else(|| JsValue::from_str("missing fib popup"))?
@@ -3351,6 +3371,18 @@ mod web_app {
             line_clear_callback.as_ref().unchecked_ref(),
         )?;
         line_clear_callback.forget();
+
+        let auto_fit_callback = Closure::wrap(Box::new(move || {
+            if let Err(err) = auto_fit_view() {
+                set_status(&format!("failed: {:?}", err));
+            }
+        }) as Box<dyn FnMut()>);
+
+        auto_fit_button.add_event_listener_with_callback(
+            "click",
+            auto_fit_callback.as_ref().unchecked_ref(),
+        )?;
+        auto_fit_callback.forget();
 
         let fib_drag_popup = fib_popup.clone();
         let fib_drag_start_callback = Closure::wrap(Box::new(move |event: MouseEvent| {

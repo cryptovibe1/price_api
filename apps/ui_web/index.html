@@ -313,7 +313,8 @@
         cursor: pointer;
       }
 
-      .controls #log-scale-toggle {
+      .controls #log-scale-toggle,
+      .controls #auto-fit {
         margin-top: 0;
         white-space: nowrap;
       }
@@ -387,6 +388,26 @@
       }
 
       #measure-toggle svg {
+        width: 18px;
+        height: 18px;
+        stroke: currentColor;
+        fill: none;
+        stroke-width: 1.8;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
+      #auto-fit {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 8px;
+        background: #ffffff;
+        color: var(--text);
+        border: 1px solid var(--line);
+      }
+
+      #auto-fit svg {
         width: 18px;
         height: 18px;
         stroke: currentColor;
@@ -885,6 +906,23 @@
                 <path d="M5 19h14" />
                 <path d="M8 16l3-4 3 2 5-7" />
                 <path d="m18 7 1-3 3 1" />
+              </svg>
+            </button>
+          </div>
+          <div>
+            <label for="auto-fit">Auto fit</label>
+            <button
+              id="auto-fit"
+              class="toggle-btn"
+              type="button"
+              aria-label="Auto fit chart"
+              title="Auto fit chart"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M3 9V3h6" />
+                <path d="M21 9V3h-6" />
+                <path d="M3 15v6h6" />
+                <path d="M21 15v6h-6" />
               </svg>
             </button>
           </div>

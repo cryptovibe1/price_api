@@ -53,6 +53,10 @@ mod web_app {
         static MEASURE_DRAG_TS: RefCell<Option<i64>> = const { RefCell::new(None) };
         static MEASURE_DRAG_PRICE: RefCell<Option<f64>> = const { RefCell::new(None) };
         static FIB_POPUP_DRAG: RefCell<Option<(f64, f64)>> = const { RefCell::new(None) };
+        static LINE_TOOL_ENABLED: RefCell<bool> = const { RefCell::new(false) };
+        static LINE_DRAFT_ANCHOR: RefCell<Option<(i64, f64)>> = const { RefCell::new(None) };
+        static LINE_PREVIEW_POINT: RefCell<Option<(i64, f64)>> = const { RefCell::new(None) };
+        static TREND_LINES: RefCell<Vec<((i64, f64), (i64, f64))>> = const { RefCell::new(Vec::new()) };
         static MA_SETTINGS_DRAG: RefCell<Option<(f64, f64)>> = const { RefCell::new(None) };
         static CONNECTION_SETTINGS_DRAG: RefCell<Option<(f64, f64)>> = const { RefCell::new(None) };
         static CHART_VIEW: RefCell<Option<ChartView>> = const { RefCell::new(None) };
@@ -316,9 +320,47 @@ mod web_app {
         Ok(())
     }
 
-    // Turn off the interactive chart tools (Drag, Price %, Fib) and reset their
-    // in-progress state. Used by the Escape key to cancel whatever is active.
+    // Turn off the interactive chart tools (Drag, Price %, Fib, Line) and reset
+    // their in-progress state. Used by the Escape key to cancel whatever is active.
     fn cancel_active_tools() -> Result<(), JsValue> {
+        DRAG_TOOL_ENABLED.with(|state| {
+            *state.borrow_mut() = false;
+        });
+        MEASURE_STATE.with(|state| {
+            let mut cfg = state.borrow_mut();
+            cfg.enabled = false;
+            cfg.anchor_a = None;
+            cfg.anchor_b = None;
+        });
+        MEASURE_DRAG_TS.with(|state| {
+            *state.borrow_mut() = None;
+        });
+        MEASURE_DRAG_PRICE.with(|state| {
+            *state.borrow_mut() = None;
+        });
+        FIB_STATE.with(|state| {
+            state.borrow_mut().enabled = false;
+        });
+        let _ = set_fib_preview_point(None);
+        LINE_TOOL_ENABLED.with(|state| {
+            *state.borrow_mut() = false;
+        });
+        LINE_DRAFT_ANCHOR.with(|state| {
+            *state.borrow_mut() = None;
+        });
+        LINE_PREVIEW_POINT.with(|state| {
+            *state.borrow_mut() = None;
+        });
+        sync_drag_button()?;
+        sync_measure_button()?;
+        sync_fib_button()?;
+        sync_line_button()?;
+        Ok(())
+    }
+
+    // Disable the other interactive tools (Drag, Price %, Fib) when the line
+    // tool is turned on, mirroring how the Fib toggle clears the rest.
+    fn disable_tools_for_line() -> Result<(), JsValue> {
         DRAG_TOOL_ENABLED.with(|state| {
             *state.borrow_mut() = false;
         });
@@ -342,6 +384,67 @@ mod web_app {
         sync_measure_button()?;
         sync_fib_button()?;
         Ok(())
+    }
+
+    // Turn the line tool off and drop any in-progress draft, used when another
+    // tool (Drag, Price %, Fib) is switched on so only one tool is active.
+    fn disable_line_tool() -> Result<(), JsValue> {
+        LINE_TOOL_ENABLED.with(|state| {
+            *state.borrow_mut() = false;
+        });
+        LINE_DRAFT_ANCHOR.with(|state| {
+            *state.borrow_mut() = None;
+        });
+        LINE_PREVIEW_POINT.with(|state| {
+            *state.borrow_mut() = None;
+        });
+        sync_line_button()
+    }
+
+    fn sync_line_button() -> Result<(), JsValue> {
+        let doc = document()?;
+        let button = doc
+            .get_element_by_id("line-toggle")
+            .ok_or_else(|| JsValue::from_str("missing line toggle button"))?;
+
+        let enabled = LINE_TOOL_ENABLED.with(|state| *state.borrow());
+        if enabled {
+            button.set_class_name("toggle-btn active");
+            button.set_attribute("aria-pressed", "true")?;
+            button.set_attribute("aria-label", "Line On")?;
+            button.set_attribute("title", "Line On")?;
+        } else {
+            button.set_class_name("toggle-btn");
+            button.set_attribute("aria-pressed", "false")?;
+            button.set_attribute("aria-label", "Line Off")?;
+            button.set_attribute("title", "Line Off")?;
+        }
+
+        Ok(())
+    }
+
+    fn clear_trend_lines() {
+        TREND_LINES.with(|state| {
+            state.borrow_mut().clear();
+        });
+        LINE_DRAFT_ANCHOR.with(|state| {
+            *state.borrow_mut() = None;
+        });
+        LINE_PREVIEW_POINT.with(|state| {
+            *state.borrow_mut() = None;
+        });
+    }
+
+    // Finished trend lines plus, while the tool is mid-draw, a live segment from
+    // the first clicked anchor to the current cursor preview point.
+    fn active_trend_lines() -> Vec<((i64, f64), (i64, f64))> {
+        let mut lines = TREND_LINES.with(|state| state.borrow().clone());
+        if let Some(anchor) = LINE_DRAFT_ANCHOR.with(|state| *state.borrow()) {
+            if let Some(preview) = LINE_PREVIEW_POINT.with(|state| *state.borrow()) {
+                lines.push((anchor, preview));
+            }
+        }
+        lines
     }
 
     fn set_load_button_loading(loading: bool) -> Result<(), JsValue> {
@@ -2144,6 +2247,7 @@ mod web_app {
         let measure_label = measure_range.map(|(start, end)| format_duration_human(end - start));
         let measure_price_label =
             measure_price_range.map(|(start, end)| format_measure_price_label(start, end));
+        let trend_lines = active_trend_lines();
 
         if use_log_scale {
             let mut chart = ChartBuilder::on(&root)
@@ -2259,6 +2363,15 @@ mod web_app {
                         ("sans-serif", 11).into_font().color(&RGBColor(122, 72, 24)),
                     )))
                     .map_err(|e| JsValue::from_str(&format!("fib label draw error: {e}")))?;
+            }
+
+            for (a, b) in &trend_lines {
+                chart
+                    .draw_series(LineSeries::new(
+                        vec![(a.0, a.1), (b.0, b.1)],
+                        RGBColor(232, 122, 18).stroke_width(2),
+                    ))
+                    .map_err(|e| JsValue::from_str(&format!("trend line draw error: {e}")))?;
             }
 
             if let Some(label) = &measure_label {
@@ -2745,6 +2858,12 @@ mod web_app {
         let fib_clear_button = doc
             .get_element_by_id("fib-clear")
             .ok_or_else(|| JsValue::from_str("missing fib clear button"))?;
+        let line_toggle_button = doc
+            .get_element_by_id("line-toggle")
+            .ok_or_else(|| JsValue::from_str("missing line toggle button"))?;
+        let line_clear_button = doc
+            .get_element_by_id("line-clear")
+            .ok_or_else(|| JsValue::from_str("missing line clear button"))?;
         let fib_popup = doc
             .get_element_by_id("fib-popup")
             .ok_or_else(|| JsValue::from_str("missing fib popup"))?
@@ -3007,6 +3126,10 @@ mod web_app {
                     set_status(&format!("failed: {:?}", err));
                     return;
                 }
+                if let Err(err) = disable_line_tool() {
+                    set_status(&format!("failed: {:?}", err));
+                    return;
+                }
                 set_status("Drag tool enabled");
                 set_fib_popup_info("Drag chart to pan X and Y axes.");
             } else {
@@ -3054,6 +3177,10 @@ mod web_app {
                     return;
                 }
                 if let Err(err) = sync_drag_button() {
+                    set_status(&format!("failed: {:?}", err));
+                    return;
+                }
+                if let Err(err) = disable_line_tool() {
                     set_status(&format!("failed: {:?}", err));
                     return;
                 }
@@ -3108,7 +3235,12 @@ mod web_app {
                     return;
                 }
             }
-            if !fib_enabled {
+            if fib_enabled {
+                if let Err(err) = disable_line_tool() {
+                    set_status(&format!("failed: {:?}", err));
+                    return;
+                }
+            } else {
                 let _ = set_fib_preview_point(None);
             }
             if let Err(err) = sync_fib_button() {
@@ -3161,6 +3293,64 @@ mod web_app {
             fib_clear_callback.as_ref().unchecked_ref(),
         )?;
         fib_clear_callback.forget();
+
+        let line_toggle_callback = Closure::wrap(Box::new(move || {
+            let next_enabled = LINE_TOOL_ENABLED.with(|state| {
+                let next = !*state.borrow();
+                *state.borrow_mut() = next;
+                next
+            });
+            if next_enabled {
+                LINE_DRAFT_ANCHOR.with(|state| {
+                    *state.borrow_mut() = None;
+                });
+                LINE_PREVIEW_POINT.with(|state| {
+                    *state.borrow_mut() = None;
+                });
+            }
+            if next_enabled {
+                if let Err(err) = disable_tools_for_line() {
+                    set_status(&format!("failed: {:?}", err));
+                    return;
+                }
+            }
+            if let Err(err) = sync_line_button() {
+                set_status(&format!("failed: {:?}", err));
+                return;
+            }
+            if next_enabled {
+                set_status("Line tool: click two points per line");
+            } else {
+                set_status("Line tool disabled");
+            }
+            spawn_local(async {
+                if let Err(err) = rerender_cached_or_fetch().await {
+                    set_status(&format!("failed: {:?}", err));
+                }
+            });
+        }) as Box<dyn FnMut()>);
+
+        line_toggle_button.add_event_listener_with_callback(
+            "click",
+            line_toggle_callback.as_ref().unchecked_ref(),
+        )?;
+        line_toggle_callback.forget();
+
+        let line_clear_callback = Closure::wrap(Box::new(move || {
+            clear_trend_lines();
+            set_status("Lines cleared");
+            spawn_local(async {
+                if let Err(err) = rerender_cached_or_fetch().await {
+                    set_status(&format!("failed: {:?}", err));
+                }
+            });
+        }) as Box<dyn FnMut()>);
+
+        line_clear_button.add_event_listener_with_callback(
+            "click",
+            line_clear_callback.as_ref().unchecked_ref(),
+        )?;
+        line_clear_callback.forget();
 
         let fib_drag_popup = fib_popup.clone();
         let fib_drag_start_callback = Closure::wrap(Box::new(move |event: MouseEvent| {
@@ -3777,6 +3967,28 @@ mod web_app {
                     need_fib_redraw = true;
                 }
 
+                // While the line tool has its first point placed, track the
+                // cursor as the live second endpoint so the segment previews.
+                let line_drawing = LINE_TOOL_ENABLED.with(|state| *state.borrow())
+                    && LINE_DRAFT_ANCHOR.with(|state| state.borrow().is_some());
+                let next_line_preview = if line_drawing {
+                    Some((cursor_ts, usd_price))
+                } else {
+                    None
+                };
+                let line_preview_changed = LINE_PREVIEW_POINT.with(|state| {
+                    let mut cur = state.borrow_mut();
+                    if *cur != next_line_preview {
+                        *cur = next_line_preview;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if line_preview_changed {
+                    need_fib_redraw = true;
+                }
+
                 set_hover_info(&format!("Hover time: {} | USD {:.2}", text, usd_price));
                 set_fib_popup_info(&fib_popup_text);
                 show_hover_tooltip(&tooltip_text, overlay_x, overlay_y);
@@ -3861,6 +4073,57 @@ mod web_app {
                 set_chart_cursor("ns-resize");
                 set_status(&format!("Dragging {label} line"));
                 set_fib_popup_info(&format!("Drag {label} line to reposition it."));
+                return;
+            }
+
+            if LINE_TOOL_ENABLED.with(|state| *state.borrow()) && !event.shift_key() {
+                let crosshair_x = (event.offset_x() as f64).clamp(plot_left, plot_right);
+                let crosshair_y = (event.offset_y() as f64).clamp(plot_top, plot_bottom);
+                let cursor_ts =
+                    match timestamp_from_canvas_x(canvas_width, canvas_height, crosshair_x) {
+                        Some(v) => v,
+                        None => return,
+                    };
+                let price = price_from_canvas_y(crosshair_y, plot_top, plot_bottom)
+                    .unwrap_or_else(|| candles.last().map(|c| c.close).unwrap_or(0.0));
+
+                let draft = LINE_DRAFT_ANCHOR.with(|state| *state.borrow());
+                let status_message = match draft {
+                    None => {
+                        LINE_DRAFT_ANCHOR.with(|state| {
+                            *state.borrow_mut() = Some((cursor_ts, price));
+                        });
+                        format!(
+                            "Line first point set: {} @ {:.2}. Click second point",
+                            unix_seconds_to_hover_text(cursor_ts),
+                            price
+                        )
+                    }
+                    Some(anchor) => {
+                        TREND_LINES.with(|state| {
+                            state.borrow_mut().push((anchor, (cursor_ts, price)));
+                        });
+                        LINE_DRAFT_ANCHOR.with(|state| {
+                            *state.borrow_mut() = None;
+                        });
+                        LINE_PREVIEW_POINT.with(|state| {
+                            *state.borrow_mut() = None;
+                        });
+                        format!(
+                            "Line drawn: {} @ {:.2} -> {} @ {:.2}. Click to start another",
+                            unix_seconds_to_hover_text(anchor.0),
+                            anchor.1,
+                            unix_seconds_to_hover_text(cursor_ts),
+                            price
+                        )
+                    }
+                };
+                set_status(&status_message);
+                spawn_local(async {
+                    if let Err(err) = rerender_cached_or_fetch().await {
+                        set_status(&format!("failed: {:?}", err));
+                    }
+                });
                 return;
             }
 

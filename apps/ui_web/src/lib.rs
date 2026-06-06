@@ -65,6 +65,9 @@ mod web_app {
         static MA_SETTINGS_DRAG: RefCell<Option<(f64, f64)>> = const { RefCell::new(None) };
         static CONNECTION_SETTINGS_DRAG: RefCell<Option<(f64, f64)>> = const { RefCell::new(None) };
         static CHART_VIEW: RefCell<Option<ChartView>> = const { RefCell::new(None) };
+        // The last price currently shown in the floating price tag, so we can
+        // flash it green/red only when the value actually changes.
+        static LAST_PRICE_TAG_VALUE: RefCell<Option<f64>> = const { RefCell::new(None) };
         static RANGE_HISTORY: RefCell<Vec<(i64, i64)>> = const { RefCell::new(Vec::new()) };
         // Which chart-source the in-memory FIB_STATE / TREND_LINES currently belong to,
         // so drawings can be swapped out and persisted per pair on chart switches.
@@ -1237,6 +1240,99 @@ mod web_app {
                     );
                 }
             }
+        }
+    }
+
+    // Position the floating last-price tag at the right edge of the plot, level
+    // with `last_close`, and flash it green (up) or red (down) when the value
+    // changes. Pass `None` to hide it (no candles / price off-screen).
+    fn update_last_price_tag(last_close: Option<f64>) {
+        let Ok(doc) = document() else {
+            return;
+        };
+        let Some(node) = doc.get_element_by_id("last-price-tag") else {
+            return;
+        };
+        let Ok(el) = node.dyn_into::<HtmlElement>() else {
+            return;
+        };
+
+        let hide = |el: &HtmlElement| {
+            let _ = el.style().set_property("display", "none");
+            el.set_class_name("");
+            LAST_PRICE_TAG_VALUE.with(|v| *v.borrow_mut() = None);
+        };
+
+        let Some(price) = last_close.filter(|p| p.is_finite()) else {
+            hide(&el);
+            return;
+        };
+
+        // Only show the tag while the price sits inside the visible band, matching
+        // the on-canvas last-price line.
+        let in_view = CHART_VIEW.with(|view| {
+            view.borrow()
+                .map(|cfg| price >= cfg.y_low && price <= cfg.y_high)
+                .unwrap_or(false)
+        });
+        if !in_view {
+            hide(&el);
+            return;
+        }
+
+        let canvas = match doc
+            .get_element_by_id("chart")
+            .and_then(|e| e.dyn_into::<HtmlCanvasElement>().ok())
+        {
+            Some(c) => c,
+            None => return,
+        };
+        let width = canvas.client_width() as f64;
+        let height = canvas.client_height() as f64;
+        let Some((_, plot_right, plot_top, plot_bottom)) = plot_bounds(width, height) else {
+            hide(&el);
+            return;
+        };
+        let Some(y) = canvas_y_from_price(price, plot_top, plot_bottom) else {
+            hide(&el);
+            return;
+        };
+
+        let canvas_rect = canvas.get_bounding_client_rect();
+        let parent_rect = canvas
+            .parent_element()
+            .map(|p| p.get_bounding_client_rect());
+        let canvas_left = parent_rect
+            .as_ref()
+            .map(|p| canvas_rect.left() - p.left())
+            .unwrap_or(0.0);
+        let canvas_top = parent_rect
+            .as_ref()
+            .map(|p| canvas_rect.top() - p.top())
+            .unwrap_or(0.0);
+
+        let style = el.style();
+        let _ = style.set_property("display", "block");
+        let _ = style.set_property(
+            "left",
+            &format!("{}px", (canvas_left + plot_right).round() as i32),
+        );
+        let _ = style.set_property("top", &format!("{}px", (canvas_top + y).round() as i32));
+        el.set_text_content(Some(&format_price_label(price)));
+
+        let prev = LAST_PRICE_TAG_VALUE.with(|v| *v.borrow());
+        let direction = match prev {
+            Some(p) if price > p => Some("flash-up"),
+            Some(p) if price < p => Some("flash-down"),
+            _ => None,
+        };
+        LAST_PRICE_TAG_VALUE.with(|v| *v.borrow_mut() = Some(price));
+
+        if let Some(direction) = direction {
+            // Restart the CSS animation: clear the class, force a reflow, re-apply.
+            el.set_class_name("");
+            let _ = el.offset_width();
+            el.set_class_name(direction);
         }
     }
 
@@ -2691,6 +2787,7 @@ mod web_app {
             .map_err(|e| JsValue::from_str(&format!("draw text error: {e}")))?;
             root.present()
                 .map_err(|e| JsValue::from_str(&format!("present error: {e}")))?;
+            update_last_price_tag(None);
             draw_rsi(candles)?;
             return Ok(());
         };
@@ -2849,16 +2946,6 @@ mod web_app {
                             color.mix(0.9),
                         ))
                         .map_err(|e| JsValue::from_str(&format!("last line draw error: {e}")))?;
-                    chart
-                        .draw_series(std::iter::once(Text::new(
-                            format_price_label(last.close),
-                            (x_end, last.close),
-                            ("sans-serif", 12)
-                                .into_font()
-                                .color(&color)
-                                .pos(Pos::new(HPos::Right, VPos::Center)),
-                        )))
-                        .map_err(|e| JsValue::from_str(&format!("last label draw error: {e}")))?;
                 }
             }
 
@@ -3051,16 +3138,6 @@ mod web_app {
                             color.mix(0.9),
                         ))
                         .map_err(|e| JsValue::from_str(&format!("last line draw error: {e}")))?;
-                    chart
-                        .draw_series(std::iter::once(Text::new(
-                            format_price_label(last.close),
-                            (x_end, last.close),
-                            ("sans-serif", 12)
-                                .into_font()
-                                .color(&color)
-                                .pos(Pos::new(HPos::Right, VPos::Center)),
-                        )))
-                        .map_err(|e| JsValue::from_str(&format!("last label draw error: {e}")))?;
                 }
             }
 
@@ -3170,6 +3247,8 @@ mod web_app {
 
         root.present()
             .map_err(|e| JsValue::from_str(&format!("present error: {e}")))?;
+
+        update_last_price_tag(candles.last().map(|c| c.close));
 
         draw_rsi(candles)?;
 

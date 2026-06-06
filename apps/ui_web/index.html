@@ -565,6 +565,53 @@
         z-index: 5;
       }
 
+      #last-price-tag {
+        position: absolute;
+        display: none;
+        /* JS sets left/top to the right edge of the plot, level with the price.
+           The element grows leftward and is vertically centred on that point. */
+        transform: translate(-100%, -50%);
+        padding: 2px 7px;
+        font-size: 12px;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+        color: #fff;
+        background: #2f7dd8;
+        border-radius: 6px;
+        box-shadow: 0 2px 6px rgba(23, 36, 56, 0.25);
+        white-space: nowrap;
+        pointer-events: none;
+        z-index: 6;
+        /* Glide vertically as the price moves rather than jumping. */
+        transition: top 0.16s ease-out;
+      }
+
+      #last-price-tag.flash-up {
+        background: #1d8e4c;
+        animation: last-price-pulse 0.45s ease-out;
+      }
+
+      #last-price-tag.flash-down {
+        background: #c63838;
+        animation: last-price-pulse 0.45s ease-out;
+      }
+
+      @keyframes last-price-pulse {
+        0% {
+          transform: translate(-100%, -50%) scale(1);
+          box-shadow: 0 2px 6px rgba(23, 36, 56, 0.25);
+        }
+        30% {
+          transform: translate(-100%, -50%) scale(1.22);
+          box-shadow: 0 0 0 4px rgba(47, 125, 216, 0.18),
+            0 4px 12px rgba(23, 36, 56, 0.35);
+        }
+        100% {
+          transform: translate(-100%, -50%) scale(1);
+          box-shadow: 0 2px 6px rgba(23, 36, 56, 0.25);
+        }
+      }
+
       #cursor-strip {
         position: relative;
         height: 24px;
@@ -965,6 +1012,7 @@
         <canvas id="chart" width="1200" height="640"></canvas>
         <div id="cursor-vline"></div>
         <div id="cursor-hline"></div>
+        <div id="last-price-tag"></div>
         <div id="hover-tooltip"></div>
         <button
           id="figure-trash"

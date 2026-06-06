@@ -48,6 +48,8 @@ mod web_app {
         static Y_PAN_LOG_OFFSET: RefCell<f64> = const { RefCell::new(0.0) };
         static Y_STRETCH_DRAG: RefCell<Option<YStretchDrag>> = const { RefCell::new(None) };
         static FIB_STATE: RefCell<FibState> = const { RefCell::new(FibState::new()) };
+        // Completed fib retracements (each a pair of anchor points).
+        static FIB_LINES: RefCell<Vec<((i64, f64), (i64, f64))>> = const { RefCell::new(Vec::new()) };
         static FIB_LEVEL_DRAG: RefCell<Option<FibLevelDrag>> = const { RefCell::new(None) };
         static FIB_PREVIEW_POINT: RefCell<Option<(i64, f64)>> = const { RefCell::new(None) };
         static MEASURE_DRAG_TS: RefCell<Option<i64>> = const { RefCell::new(None) };
@@ -61,6 +63,15 @@ mod web_app {
         static CONNECTION_SETTINGS_DRAG: RefCell<Option<(f64, f64)>> = const { RefCell::new(None) };
         static CHART_VIEW: RefCell<Option<ChartView>> = const { RefCell::new(None) };
         static RANGE_HISTORY: RefCell<Vec<(i64, i64)>> = const { RefCell::new(Vec::new()) };
+        // Which chart-source the in-memory FIB_STATE / TREND_LINES currently belong to,
+        // so drawings can be swapped out and persisted per pair on chart switches.
+        static CURRENT_PAIR_KEY: RefCell<String> = const { RefCell::new(String::new()) };
+        // The figure currently under the hover trash icon, the pending hide timer
+        // handle, and the reusable timeout callback that hides the icon.
+        static FIGURE_TRASH_TARGET: RefCell<Option<FigureTarget>> = const { RefCell::new(None) };
+        static FIGURE_TRASH_HIDE_TIMER: RefCell<Option<i32>> = const { RefCell::new(None) };
+        static FIGURE_TRASH_HIDE_CLOSURE: RefCell<Option<Closure<dyn FnMut()>>> =
+            const { RefCell::new(None) };
     }
 
     const STORAGE_KEY_API_BASE: &str = "price_api.api_base";
@@ -77,6 +88,8 @@ mod web_app {
     const STORAGE_KEY_VIEW_START: &str = "price_api.view_start";
     const STORAGE_KEY_VIEW_END: &str = "price_api.view_end";
     const STORAGE_KEY_VIEW_PERIOD: &str = "price_api.view_period";
+    const STORAGE_KEY_FIB_PREFIX: &str = "price_api.fib.";
+    const STORAGE_KEY_LINES_PREFIX: &str = "price_api.lines.";
     const MA_COUNT: usize = 15;
 
     #[derive(Clone, Copy)]
@@ -102,10 +115,27 @@ mod web_app {
         start_factor: f64,
     }
 
+    // Which anchor (100% or 0% line) of which completed fib is being dragged.
     #[derive(Clone, Copy)]
     enum FibLevelDrag {
-        AnchorA,
-        AnchorB,
+        AnchorA(usize),
+        AnchorB(usize),
+    }
+
+    impl FibLevelDrag {
+        fn index(self) -> usize {
+            match self {
+                FibLevelDrag::AnchorA(idx) | FibLevelDrag::AnchorB(idx) => idx,
+            }
+        }
+    }
+
+    // A drawn figure the on-chart trash icon can delete when hovered.
+    #[derive(Clone, Copy, PartialEq)]
+    enum FigureTarget {
+        Fib(usize),
+        Measure,
+        TrendLine(usize),
     }
 
     struct LiveWsConnection {
@@ -144,19 +174,19 @@ mod web_app {
         }
     }
 
+    // The fib tool state: whether it is active and the first clicked point of an
+    // in-progress fib (the completed fibs live in FIB_LINES).
     #[derive(Clone, Copy)]
     struct FibState {
         enabled: bool,
-        anchor_a: Option<(i64, f64)>,
-        anchor_b: Option<(i64, f64)>,
+        draft: Option<(i64, f64)>,
     }
 
     impl FibState {
         const fn new() -> Self {
             Self {
                 enabled: false,
-                anchor_a: None,
-                anchor_b: None,
+                draft: None,
             }
         }
     }
@@ -166,6 +196,25 @@ mod web_app {
         x_start: i64,
         x_end: i64,
         levels: Vec<(f64, f64)>,
+    }
+
+    // Fib retracement levels shared by every fib overlay.
+    const FIB_RATIOS: [f64; 11] = [
+        0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.681, 2.618, 3.618, 4.236,
+    ];
+
+    // Build a fib overlay from its two anchor points (a = 100% line, b = 0% line).
+    fn fib_overlay_from_anchors(a: (i64, f64), b: (i64, f64)) -> FibOverlay {
+        let ((ts_a, price_a), (ts_b, price_b)) = (a, b);
+        let delta = price_b - price_a;
+        FibOverlay {
+            x_start: ts_a.min(ts_b),
+            x_end: ts_a.max(ts_b),
+            levels: FIB_RATIOS
+                .into_iter()
+                .map(|r| (r, price_b - delta * r))
+                .collect(),
+        }
     }
 
     fn document() -> Result<Document, JsValue> {
@@ -320,17 +369,15 @@ mod web_app {
         Ok(())
     }
 
-    // Turn off the interactive chart tools (Drag, Price %, Fib, Line) and reset
-    // their in-progress state. Used by the Escape key to cancel whatever is active.
+    // Turn off the interactive chart tools (Drag, Price %, Fib, Line) without
+    // discarding their finished drawings. Used by the Escape key to deactivate
+    // whatever tool is on while keeping the fib, lines and price range on screen.
     fn cancel_active_tools() -> Result<(), JsValue> {
         DRAG_TOOL_ENABLED.with(|state| {
             *state.borrow_mut() = false;
         });
         MEASURE_STATE.with(|state| {
-            let mut cfg = state.borrow_mut();
-            cfg.enabled = false;
-            cfg.anchor_a = None;
-            cfg.anchor_b = None;
+            state.borrow_mut().enabled = false;
         });
         MEASURE_DRAG_TS.with(|state| {
             *state.borrow_mut() = None;
@@ -435,6 +482,104 @@ mod web_app {
         });
     }
 
+    // chart-source select value, used as the key for per-pair drawing storage.
+    fn current_pair_key() -> String {
+        select_value("chart-source").unwrap_or_default()
+    }
+
+    fn serialize_segments(segments: &[((i64, f64), (i64, f64))]) -> String {
+        segments
+            .iter()
+            .map(|((a_ts, a_price), (b_ts, b_price))| {
+                format!("{a_ts},{a_price},{b_ts},{b_price}")
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
+    fn parse_segments(value: &str) -> Vec<((i64, f64), (i64, f64))> {
+        value
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .filter_map(|segment| {
+                let parts: Vec<&str> = segment.split(',').collect();
+                parse_drawing_point(&parts)
+            })
+            .collect()
+    }
+
+    // Serialize the finished fibs and trend lines for `pair` into localStorage so
+    // each chart source keeps its own drawings across switches and reloads.
+    fn persist_pair_drawings(pair: &str) {
+        if pair.is_empty() {
+            return;
+        }
+        let Ok(storage) = storage() else {
+            return;
+        };
+        let fib_value = FIB_LINES.with(|state| serialize_segments(&state.borrow()));
+        let _ = storage.set_item(&format!("{STORAGE_KEY_FIB_PREFIX}{pair}"), &fib_value);
+
+        let lines_value = TREND_LINES.with(|state| serialize_segments(&state.borrow()));
+        let _ = storage.set_item(&format!("{STORAGE_KEY_LINES_PREFIX}{pair}"), &lines_value);
+    }
+
+    // Persist whatever pair the in-memory drawings currently belong to.
+    fn persist_current_pair_drawings() {
+        let pair = CURRENT_PAIR_KEY.with(|cur| cur.borrow().clone());
+        persist_pair_drawings(&pair);
+    }
+
+    fn parse_drawing_point(parts: &[&str]) -> Option<((i64, f64), (i64, f64))> {
+        if parts.len() != 4 {
+            return None;
+        }
+        Some((
+            (parts[0].parse().ok()?, parts[1].parse().ok()?),
+            (parts[2].parse().ok()?, parts[3].parse().ok()?),
+        ))
+    }
+
+    // Replace the in-memory fibs + trend lines with the drawings saved for `pair`,
+    // discarding any in-progress draft from the previous pair.
+    fn load_pair_drawings(pair: &str) {
+        clear_trend_lines();
+        clear_measure();
+        clear_fib_levels();
+
+        let Ok(storage) = storage() else {
+            return;
+        };
+
+        if let Ok(Some(value)) = storage.get_item(&format!("{STORAGE_KEY_FIB_PREFIX}{pair}")) {
+            let fibs = parse_segments(&value);
+            FIB_LINES.with(|state| {
+                *state.borrow_mut() = fibs;
+            });
+        }
+
+        if let Ok(Some(value)) = storage.get_item(&format!("{STORAGE_KEY_LINES_PREFIX}{pair}")) {
+            let lines = parse_segments(&value);
+            TREND_LINES.with(|state| {
+                *state.borrow_mut() = lines;
+            });
+        }
+    }
+
+    // Save the current pair's drawings then load the drawings belonging to
+    // `next_pair`, updating the tracked current pair.
+    fn switch_pair_drawings(next_pair: &str) {
+        let previous = CURRENT_PAIR_KEY.with(|cur| cur.borrow().clone());
+        if previous == next_pair {
+            return;
+        }
+        persist_pair_drawings(&previous);
+        load_pair_drawings(next_pair);
+        CURRENT_PAIR_KEY.with(|cur| {
+            *cur.borrow_mut() = next_pair.to_string();
+        });
+    }
+
     // Finished trend lines plus, while the tool is mid-draw, a live segment from
     // the first clicked anchor to the current cursor preview point.
     fn active_trend_lines() -> Vec<((i64, f64), (i64, f64))> {
@@ -467,28 +612,32 @@ mod web_app {
         Ok(())
     }
 
-    fn active_fib_overlay() -> Option<FibOverlay> {
-        FIB_STATE.with(|state| {
-            let cfg = *state.borrow();
-            let (ts_a, price_a) = cfg.anchor_a?;
-            let (ts_b, price_b) = match (cfg.anchor_b, cfg.enabled) {
-                (Some(v), _) => v,
-                (None, true) => FIB_PREVIEW_POINT.with(|preview| *preview.borrow())?,
-                (None, false) => return None,
-            };
-            let delta = price_b - price_a;
-            let ratios = [
-                0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.681, 2.618, 3.618, 4.236,
-            ];
-            Some(FibOverlay {
-                x_start: ts_a.min(ts_b),
-                x_end: ts_a.max(ts_b),
-                levels: ratios
-                    .into_iter()
-                    .map(|r| (r, price_b - delta * r))
-                    .collect(),
-            })
-        })
+    // The live preview fib while the tool is mid-draw (first point placed, cursor
+    // tracking the second), if any.
+    fn fib_preview_anchors() -> Option<((i64, f64), (i64, f64))> {
+        let cfg = FIB_STATE.with(|state| *state.borrow());
+        if !cfg.enabled {
+            return None;
+        }
+        let draft = cfg.draft?;
+        let preview = FIB_PREVIEW_POINT.with(|preview| *preview.borrow())?;
+        Some((draft, preview))
+    }
+
+    // All completed fibs plus, while drawing, the live preview fib. Used for
+    // rendering only (hit-testing iterates FIB_LINES directly for indices).
+    fn active_fib_overlays() -> Vec<FibOverlay> {
+        let mut overlays: Vec<FibOverlay> = FIB_LINES.with(|state| {
+            state
+                .borrow()
+                .iter()
+                .map(|(a, b)| fib_overlay_from_anchors(*a, *b))
+                .collect()
+        });
+        if let Some((a, b)) = fib_preview_anchors() {
+            overlays.push(fib_overlay_from_anchors(a, b));
+        }
+        overlays
     }
 
     fn active_measure_range() -> Option<(i64, i64)> {
@@ -542,41 +691,36 @@ mod web_app {
 
     fn fib_level_drag_label(level: FibLevelDrag) -> &'static str {
         match level {
-            FibLevelDrag::AnchorA => "Fib 1.0 (100%)",
-            FibLevelDrag::AnchorB => "Fib 0.0 (0%)",
+            FibLevelDrag::AnchorA(_) => "Fib 1.0 (100%)",
+            FibLevelDrag::AnchorB(_) => "Fib 0.0 (0%)",
         }
     }
 
     fn finished_fib_level_price(level: FibLevelDrag) -> Option<f64> {
-        FIB_STATE.with(|state| {
-            let cfg = *state.borrow();
-            if cfg.anchor_b.is_none() {
-                return None;
-            }
+        FIB_LINES.with(|state| {
+            let lines = state.borrow();
+            let (a, b) = lines.get(level.index())?;
             match level {
-                FibLevelDrag::AnchorA => cfg.anchor_a.map(|(_, price)| price),
-                FibLevelDrag::AnchorB => cfg.anchor_b.map(|(_, price)| price),
+                FibLevelDrag::AnchorA(_) => Some(a.1),
+                FibLevelDrag::AnchorB(_) => Some(b.1),
             }
         })
     }
 
     fn set_fib_level_price(level: FibLevelDrag, next_price: f64) -> bool {
-        FIB_STATE.with(|state| {
-            let mut cfg = state.borrow_mut();
-            if cfg.anchor_b.is_none() {
+        FIB_LINES.with(|state| {
+            let mut lines = state.borrow_mut();
+            let Some((a, b)) = lines.get_mut(level.index()) else {
                 return false;
-            }
+            };
             let target = match level {
-                FibLevelDrag::AnchorA => &mut cfg.anchor_a,
-                FibLevelDrag::AnchorB => &mut cfg.anchor_b,
+                FibLevelDrag::AnchorA(_) => a,
+                FibLevelDrag::AnchorB(_) => b,
             };
-            let Some((ts, current_price)) = *target else {
-                return false;
-            };
-            if (current_price - next_price).abs() < 0.01 {
+            if (target.1 - next_price).abs() < 0.01 {
                 return false;
             }
-            *target = Some((ts, next_price));
+            target.1 = next_price;
             true
         })
     }
@@ -611,17 +755,77 @@ mod web_app {
         })
     }
 
-    fn fib_level_hit_test(offset_y: f64, plot_top: f64, plot_bottom: f64) -> Option<FibLevelDrag> {
-        [FibLevelDrag::AnchorA, FibLevelDrag::AnchorB]
-            .into_iter()
-            .filter_map(|level| {
-                let line_price = finished_fib_level_price(level)?;
-                let line_y = canvas_y_from_price(line_price, plot_top, plot_bottom)?;
-                Some((level, (offset_y - line_y).abs()))
-            })
-            .filter(|(_, distance)| *distance <= 8.0)
-            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(level, _)| level)
+    // Forward map of a timestamp to its canvas x (CSS px). Unlike
+    // `timestamp_from_canvas_x` this does not clamp, so off-screen figure
+    // endpoints keep their true geometry for hit-testing.
+    fn canvas_x_from_timestamp(ts: i64, plot_left: f64, plot_right: f64) -> Option<f64> {
+        if plot_right <= plot_left {
+            return None;
+        }
+        CHART_VIEW.with(|view| {
+            let cfg = (*view.borrow())?;
+            let span = (cfg.x_end - cfg.x_start).max(60) as f64;
+            let ratio = (ts - cfg.x_start) as f64 / span;
+            Some(plot_left + ratio * (plot_right - plot_left))
+        })
+    }
+
+    fn point_segment_distance(px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
+        let dx = bx - ax;
+        let dy = by - ay;
+        let len_sq = dx * dx + dy * dy;
+        if len_sq <= f64::EPSILON {
+            return ((px - ax).powi(2) + (py - ay).powi(2)).sqrt();
+        }
+        let t = (((px - ax) * dx + (py - ay) * dy) / len_sq).clamp(0.0, 1.0);
+        let proj_x = ax + t * dx;
+        let proj_y = ay + t * dy;
+        ((px - proj_x).powi(2) + (py - proj_y).powi(2)).sqrt()
+    }
+
+    // Find the draggable fib anchor line (0% or 100% of some completed fib) under
+    // the cursor, restricted to that fib's horizontal span.
+    fn fib_level_hit_test(
+        cursor_x: f64,
+        offset_y: f64,
+        plot_left: f64,
+        plot_right: f64,
+        plot_top: f64,
+        plot_bottom: f64,
+    ) -> Option<FibLevelDrag> {
+        let (view_x_start, view_x_end) = CHART_VIEW.with(|view| {
+            view.borrow()
+                .map(|cfg| (cfg.x_start, cfg.x_end))
+                .unwrap_or((0, 0))
+        });
+        let fibs = FIB_LINES.with(|state| state.borrow().clone());
+        let mut best: Option<(FibLevelDrag, f64)> = None;
+        for (idx, (a, b)) in fibs.iter().enumerate() {
+            let (Some(xs), Some(xe)) = (
+                canvas_x_from_timestamp(a.0.min(b.0).clamp(view_x_start, view_x_end), plot_left, plot_right),
+                canvas_x_from_timestamp(a.0.max(b.0).clamp(view_x_start, view_x_end), plot_left, plot_right),
+            ) else {
+                continue;
+            };
+            if cursor_x < xs - 2.0 || cursor_x > xe + 2.0 {
+                continue;
+            }
+            for level in [FibLevelDrag::AnchorA(idx), FibLevelDrag::AnchorB(idx)] {
+                let price = if matches!(level, FibLevelDrag::AnchorA(_)) {
+                    a.1
+                } else {
+                    b.1
+                };
+                let Some(line_y) = canvas_y_from_price(price, plot_top, plot_bottom) else {
+                    continue;
+                };
+                let distance = (offset_y - line_y).abs();
+                if distance <= 8.0 && best.as_ref().map(|(_, d)| distance < *d).unwrap_or(true) {
+                    best = Some((level, distance));
+                }
+            }
+        }
+        best.map(|(level, _)| level)
     }
 
     fn redraw_visible_chart_only() -> Result<(), JsValue> {
@@ -663,28 +867,46 @@ mod web_app {
         parts.join(" ")
     }
 
-    fn visible_fib_levels(
-        fib_overlay: &Option<FibOverlay>,
+    // Per-fib data ready to render: x span clamped to the view, a label anchor,
+    // and the levels currently within the visible price band.
+    struct FibRender {
+        x_start: i64,
+        x_end: i64,
+        label_x: i64,
+        levels: Vec<(f64, f64)>,
+    }
+
+    fn fib_renders(
+        x_start: i64,
+        x_end: i64,
         y_low: f64,
         y_high: f64,
         log_scale: bool,
-    ) -> Vec<(f64, f64)> {
-        fib_overlay
-            .as_ref()
+    ) -> Vec<FibRender> {
+        active_fib_overlays()
+            .into_iter()
             .map(|overlay| {
-                overlay
+                let start = overlay.x_start.clamp(x_start, x_end);
+                let end = overlay.x_end.clamp(x_start, x_end);
+                let label_x = (start + ((end - start).max(60) / 40).max(1)).min(x_end);
+                let levels = overlay
                     .levels
-                    .iter()
-                    .copied()
+                    .into_iter()
                     .filter(|(_, level_price)| {
                         level_price.is_finite()
                             && (!log_scale || *level_price > 0.0)
                             && *level_price >= y_low
                             && *level_price <= y_high
                     })
-                    .collect()
+                    .collect();
+                FibRender {
+                    x_start: start.min(end),
+                    x_end: start.max(end),
+                    label_x,
+                    levels,
+                }
             })
-            .unwrap_or_default()
+            .collect()
     }
 
     fn set_status(text: &str) {
@@ -711,13 +933,226 @@ mod web_app {
         }
     }
 
+    // Remove all fibs and any in-progress draft.
     fn clear_fib_levels() {
+        FIB_LINES.with(|state| {
+            state.borrow_mut().clear();
+        });
         FIB_STATE.with(|state| {
+            state.borrow_mut().draft = None;
+        });
+        let _ = set_fib_preview_point(None);
+    }
+
+    fn clear_measure() {
+        MEASURE_STATE.with(|state| {
             let mut cfg = state.borrow_mut();
             cfg.anchor_a = None;
             cfg.anchor_b = None;
         });
-        let _ = set_fib_preview_point(None);
+        MEASURE_DRAG_TS.with(|state| {
+            *state.borrow_mut() = None;
+        });
+        MEASURE_DRAG_PRICE.with(|state| {
+            *state.borrow_mut() = None;
+        });
+    }
+
+    // Find the drawn figure (trend line, fib, or price range) nearest the cursor.
+    // Returns the matched figure plus a point on it (canvas CSS px) where the
+    // trash icon should sit.
+    fn figure_hit_test(
+        cursor_x: f64,
+        cursor_y: f64,
+        plot_left: f64,
+        plot_right: f64,
+        plot_top: f64,
+        plot_bottom: f64,
+    ) -> Option<(FigureTarget, f64, f64)> {
+        const TOL: f64 = 7.0;
+        // (target, distance, anchor_x, anchor_y)
+        let mut candidates: Vec<(FigureTarget, f64, f64, f64)> = Vec::new();
+
+        let (view_x_start, view_x_end, y_low, y_high) = CHART_VIEW.with(|view| {
+            view.borrow()
+                .map(|cfg| (cfg.x_start, cfg.x_end, cfg.y_low, cfg.y_high))
+                .unwrap_or((0, 0, 0.0, 0.0))
+        });
+        let clamp_x = |x: f64| x.clamp(plot_left, plot_right);
+        let clamp_y = |y: f64| y.clamp(plot_top, plot_bottom);
+
+        let trend_lines = TREND_LINES.with(|state| state.borrow().clone());
+        for (idx, ((a_ts, a_price), (b_ts, b_price))) in trend_lines.iter().enumerate() {
+            let (Some(ax), Some(ay), Some(bx), Some(by)) = (
+                canvas_x_from_timestamp(*a_ts, plot_left, plot_right),
+                canvas_y_from_price(*a_price, plot_top, plot_bottom),
+                canvas_x_from_timestamp(*b_ts, plot_left, plot_right),
+                canvas_y_from_price(*b_price, plot_top, plot_bottom),
+            ) else {
+                continue;
+            };
+            let dist = point_segment_distance(cursor_x, cursor_y, ax, ay, bx, by);
+            candidates.push((
+                FigureTarget::TrendLine(idx),
+                dist,
+                clamp_x((ax + bx) / 2.0),
+                clamp_y((ay + by) / 2.0),
+            ));
+        }
+
+        let fibs = FIB_LINES.with(|state| state.borrow().clone());
+        for (idx, (a, b)) in fibs.iter().enumerate() {
+            let overlay = fib_overlay_from_anchors(*a, *b);
+            let (Some(fx_start), Some(fx_end)) = (
+                canvas_x_from_timestamp(overlay.x_start.clamp(view_x_start, view_x_end), plot_left, plot_right),
+                canvas_x_from_timestamp(overlay.x_end.clamp(view_x_start, view_x_end), plot_left, plot_right),
+            ) else {
+                continue;
+            };
+            for (_ratio, price) in &overlay.levels {
+                if !price.is_finite() || *price < y_low || *price > y_high {
+                    continue;
+                }
+                let Some(ly) = canvas_y_from_price(*price, plot_top, plot_bottom) else {
+                    continue;
+                };
+                let dist = point_segment_distance(cursor_x, cursor_y, fx_start, ly, fx_end, ly);
+                candidates.push((FigureTarget::Fib(idx), dist, clamp_x(fx_end), clamp_y(ly)));
+            }
+        }
+
+        if let (Some((mt_start, mt_end)), Some((p_start, p_end))) =
+            (active_measure_range(), active_measure_price_range())
+        {
+            let xs = canvas_x_from_timestamp(mt_start.clamp(view_x_start, view_x_end), plot_left, plot_right);
+            let xe = canvas_x_from_timestamp(mt_end.clamp(view_x_start, view_x_end), plot_left, plot_right);
+            let ys = canvas_y_from_price(p_start, plot_top, plot_bottom);
+            let ye = canvas_y_from_price(p_end, plot_top, plot_bottom);
+            if let (Some(xs), Some(xe), Some(ys), Some(ye)) = (xs, xe, ys, ye) {
+                // Distance to the price-range box edges.
+                let edges = [
+                    (xs, ys, xe, ys),
+                    (xs, ye, xe, ye),
+                    (xs, ys, xs, ye),
+                    (xe, ys, xe, ye),
+                ];
+                let dist = edges
+                    .into_iter()
+                    .map(|(ax, ay, bx, by)| {
+                        point_segment_distance(cursor_x, cursor_y, ax, ay, bx, by)
+                    })
+                    .fold(f64::INFINITY, f64::min);
+                candidates.push((
+                    FigureTarget::Measure,
+                    dist,
+                    clamp_x(xe),
+                    clamp_y((ys + ye) / 2.0),
+                ));
+            }
+        }
+
+        candidates
+            .into_iter()
+            .filter(|(_, dist, _, _)| *dist <= TOL)
+            .min_by(|(_, a, _, _), (_, b, _, _)| {
+                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(target, _, x, y)| (target, x, y))
+    }
+
+    fn delete_figure(target: FigureTarget) {
+        match target {
+            FigureTarget::Fib(idx) => {
+                FIB_LINES.with(|state| {
+                    let mut fibs = state.borrow_mut();
+                    if idx < fibs.len() {
+                        fibs.remove(idx);
+                    }
+                });
+            }
+            FigureTarget::Measure => clear_measure(),
+            FigureTarget::TrendLine(idx) => {
+                TREND_LINES.with(|state| {
+                    let mut lines = state.borrow_mut();
+                    if idx < lines.len() {
+                        lines.remove(idx);
+                    }
+                });
+            }
+        }
+        persist_current_pair_drawings();
+    }
+
+    fn position_figure_trash(container_x: f64, container_y: f64) {
+        if let Ok(doc) = document() {
+            if let Some(el) = doc
+                .get_element_by_id("figure-trash")
+                .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+            {
+                let _ = el.style().set_property("display", "flex");
+                let _ = el
+                    .style()
+                    .set_property("left", &format!("{}px", container_x.round() as i32));
+                let _ = el
+                    .style()
+                    .set_property("top", &format!("{}px", container_y.round() as i32));
+            }
+        }
+    }
+
+    fn cancel_figure_trash_timer() {
+        FIGURE_TRASH_HIDE_TIMER.with(|timer| {
+            if let Some(id) = timer.borrow_mut().take() {
+                if let Some(win) = web_sys::window() {
+                    win.clear_timeout_with_handle(id);
+                }
+            }
+        });
+    }
+
+    // Immediately hide the trash icon and forget its target (used during drags,
+    // pans, active tools and when the cursor leaves the plot).
+    fn hide_figure_trash() {
+        cancel_figure_trash_timer();
+        FIGURE_TRASH_TARGET.with(|target| {
+            *target.borrow_mut() = None;
+        });
+        if let Ok(doc) = document() {
+            if let Some(el) = doc
+                .get_element_by_id("figure-trash")
+                .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+            {
+                let _ = el.style().set_property("display", "none");
+            }
+        }
+    }
+
+    // Hide after a short grace period so the cursor can travel from the figure to
+    // the icon without it vanishing. A no-op if a hide is already pending or no
+    // figure is targeted.
+    fn schedule_hide_figure_trash() {
+        if FIGURE_TRASH_HIDE_TIMER.with(|timer| timer.borrow().is_some()) {
+            return;
+        }
+        if FIGURE_TRASH_TARGET.with(|target| target.borrow().is_none()) {
+            return;
+        }
+        FIGURE_TRASH_HIDE_CLOSURE.with(|closure| {
+            if let Some(closure) = closure.borrow().as_ref() {
+                if let Some(win) = web_sys::window() {
+                    if let Ok(id) = win
+                        .set_timeout_with_callback_and_timeout_and_arguments_0(
+                            closure.as_ref().unchecked_ref(),
+                            180,
+                        )
+                    {
+                        FIGURE_TRASH_HIDE_TIMER.with(|timer| {
+                            *timer.borrow_mut() = Some(id);
+                        });
+                    }
+                }
+            }
+        });
     }
 
     fn show_fib_popup() {
@@ -737,20 +1172,19 @@ mod web_app {
                 return "Fib is off. Toggle Fib to start.".to_string();
             }
 
-            match (cfg.anchor_a, cfg.anchor_b) {
-                (None, _) => format!(
+            match cfg.draft {
+                None => format!(
                     "Fib is on. Cursor: {} @ {:.2}. Click first point.",
                     unix_seconds_to_hover_text(cursor_ts),
                     cursor_price
                 ),
-                (Some((a_ts, a_price)), None) => format!(
+                Some((a_ts, a_price)) => format!(
                     "A: {} @ {:.2}. Cursor: {} @ {:.2}. Click second point.",
                     unix_seconds_to_hover_text(a_ts),
                     a_price,
                     unix_seconds_to_hover_text(cursor_ts),
                     cursor_price
                 ),
-                (Some(_), Some(_)) => "Fib ready. Click to start new.".to_string(),
             }
         })
     }
@@ -2168,7 +2602,6 @@ mod web_app {
             draw_rsi(candles)?;
             return Ok(());
         };
-        let fib_overlay = active_fib_overlay();
         let measure_range = active_measure_range();
         let measure_price_range = active_measure_price_range();
 
@@ -2239,16 +2672,7 @@ mod web_app {
             })
             .filter(|(_, points)| !points.is_empty())
             .collect();
-        let visible_fib_levels = visible_fib_levels(&fib_overlay, y_low, y_high, use_log_scale);
-        let (fib_x_start, fib_x_end, fib_label_x) = fib_overlay
-            .as_ref()
-            .map(|overlay| {
-                let start = overlay.x_start.clamp(x_start, x_end);
-                let end = overlay.x_end.clamp(x_start, x_end);
-                let label_x = start + ((end - start).max(60) / 40).max(1);
-                (start.min(end), start.max(end), label_x.min(x_end))
-            })
-            .unwrap_or((x_start, x_end, x_start));
+        let fib_renders = fib_renders(x_start, x_end, y_low, y_high, use_log_scale);
         let (measure_x_start, measure_x_end, measure_label_x) = measure_range
             .map(|(start, end)| {
                 let start = start.clamp(x_start, x_end);
@@ -2346,40 +2770,44 @@ mod web_app {
                 }
             }
 
-            if fib_overlay.is_some() && fib_x_end > fib_x_start {
-                chart
-                    .draw_series([
-                        PathElement::new(
-                            vec![(fib_x_start, y_low), (fib_x_start, y_high)],
-                            RGBColor(173, 104, 32).mix(0.25),
-                        ),
-                        PathElement::new(
-                            vec![(fib_x_end, y_low), (fib_x_end, y_high)],
-                            RGBColor(173, 104, 32).mix(0.25),
-                        ),
-                    ])
-                    .map_err(|e| JsValue::from_str(&format!("fib boundary draw error: {e}")))?;
-            }
+            for render in &fib_renders {
+                if render.x_end > render.x_start {
+                    chart
+                        .draw_series([
+                            PathElement::new(
+                                vec![(render.x_start, y_low), (render.x_start, y_high)],
+                                RGBColor(173, 104, 32).mix(0.25),
+                            ),
+                            PathElement::new(
+                                vec![(render.x_end, y_low), (render.x_end, y_high)],
+                                RGBColor(173, 104, 32).mix(0.25),
+                            ),
+                        ])
+                        .map_err(|e| {
+                            JsValue::from_str(&format!("fib boundary draw error: {e}"))
+                        })?;
+                }
 
-            for (ratio, level_price) in &visible_fib_levels {
-                chart
-                    .draw_series(LineSeries::new(
-                        vec![(fib_x_start, *level_price), (fib_x_end, *level_price)],
-                        &RGBColor(173, 104, 32),
-                    ))
-                    .map_err(|e| JsValue::from_str(&format!("fib draw error: {e}")))?;
-                chart
-                    .draw_series(std::iter::once(Text::new(
-                        format!(
-                            "{} ({:.1}%)  {:.2}",
-                            fib_ratio_label(*ratio),
-                            ratio * 100.0,
-                            level_price
-                        ),
-                        (fib_label_x, *level_price),
-                        ("sans-serif", 11).into_font().color(&RGBColor(122, 72, 24)),
-                    )))
-                    .map_err(|e| JsValue::from_str(&format!("fib label draw error: {e}")))?;
+                for (ratio, level_price) in &render.levels {
+                    chart
+                        .draw_series(LineSeries::new(
+                            vec![(render.x_start, *level_price), (render.x_end, *level_price)],
+                            &RGBColor(173, 104, 32),
+                        ))
+                        .map_err(|e| JsValue::from_str(&format!("fib draw error: {e}")))?;
+                    chart
+                        .draw_series(std::iter::once(Text::new(
+                            format!(
+                                "{} ({:.1}%)  {:.2}",
+                                fib_ratio_label(*ratio),
+                                ratio * 100.0,
+                                level_price
+                            ),
+                            (render.label_x, *level_price),
+                            ("sans-serif", 11).into_font().color(&RGBColor(122, 72, 24)),
+                        )))
+                        .map_err(|e| JsValue::from_str(&format!("fib label draw error: {e}")))?;
+                }
             }
 
             for (a, b) in &trend_lines {
@@ -2544,40 +2972,44 @@ mod web_app {
                 }
             }
 
-            if fib_overlay.is_some() && fib_x_end > fib_x_start {
-                chart
-                    .draw_series([
-                        PathElement::new(
-                            vec![(fib_x_start, y_low), (fib_x_start, y_high)],
-                            RGBColor(173, 104, 32).mix(0.25),
-                        ),
-                        PathElement::new(
-                            vec![(fib_x_end, y_low), (fib_x_end, y_high)],
-                            RGBColor(173, 104, 32).mix(0.25),
-                        ),
-                    ])
-                    .map_err(|e| JsValue::from_str(&format!("fib boundary draw error: {e}")))?;
-            }
+            for render in &fib_renders {
+                if render.x_end > render.x_start {
+                    chart
+                        .draw_series([
+                            PathElement::new(
+                                vec![(render.x_start, y_low), (render.x_start, y_high)],
+                                RGBColor(173, 104, 32).mix(0.25),
+                            ),
+                            PathElement::new(
+                                vec![(render.x_end, y_low), (render.x_end, y_high)],
+                                RGBColor(173, 104, 32).mix(0.25),
+                            ),
+                        ])
+                        .map_err(|e| {
+                            JsValue::from_str(&format!("fib boundary draw error: {e}"))
+                        })?;
+                }
 
-            for (ratio, level_price) in &visible_fib_levels {
-                chart
-                    .draw_series(LineSeries::new(
-                        vec![(fib_x_start, *level_price), (fib_x_end, *level_price)],
-                        &RGBColor(173, 104, 32),
-                    ))
-                    .map_err(|e| JsValue::from_str(&format!("fib draw error: {e}")))?;
-                chart
-                    .draw_series(std::iter::once(Text::new(
-                        format!(
-                            "{} ({:.1}%)  {:.2}",
-                            fib_ratio_label(*ratio),
-                            ratio * 100.0,
-                            level_price
-                        ),
-                        (fib_label_x, *level_price),
-                        ("sans-serif", 11).into_font().color(&RGBColor(122, 72, 24)),
-                    )))
-                    .map_err(|e| JsValue::from_str(&format!("fib label draw error: {e}")))?;
+                for (ratio, level_price) in &render.levels {
+                    chart
+                        .draw_series(LineSeries::new(
+                            vec![(render.x_start, *level_price), (render.x_end, *level_price)],
+                            &RGBColor(173, 104, 32),
+                        ))
+                        .map_err(|e| JsValue::from_str(&format!("fib draw error: {e}")))?;
+                    chart
+                        .draw_series(std::iter::once(Text::new(
+                            format!(
+                                "{} ({:.1}%)  {:.2}",
+                                fib_ratio_label(*ratio),
+                                ratio * 100.0,
+                                level_price
+                            ),
+                            (render.label_x, *level_price),
+                            ("sans-serif", 11).into_font().color(&RGBColor(122, 72, 24)),
+                        )))
+                        .map_err(|e| JsValue::from_str(&format!("fib label draw error: {e}")))?;
+                }
             }
 
             if let Some(label) = &measure_label {
@@ -2825,6 +3257,19 @@ mod web_app {
 
     fn setup_defaults() -> Result<(), JsValue> {
         load_saved_inputs()?;
+        // Restore the saved drawings for whichever pair is selected on load.
+        let pair = current_pair_key();
+        load_pair_drawings(&pair);
+        CURRENT_PAIR_KEY.with(|cur| {
+            *cur.borrow_mut() = pair;
+        });
+        // Reusable timeout callback that hides the on-chart trash icon.
+        FIGURE_TRASH_HIDE_CLOSURE.with(|closure| {
+            if closure.borrow().is_none() {
+                *closure.borrow_mut() =
+                    Some(Closure::wrap(Box::new(hide_figure_trash) as Box<dyn FnMut()>));
+            }
+        });
         sync_fib_button()?;
         sync_drag_button()?;
         sync_measure_button()?;
@@ -2872,15 +3317,12 @@ mod web_app {
         let fib_toggle_button = doc
             .get_element_by_id("fib-toggle")
             .ok_or_else(|| JsValue::from_str("missing fib toggle button"))?;
-        let fib_clear_button = doc
-            .get_element_by_id("fib-clear")
-            .ok_or_else(|| JsValue::from_str("missing fib clear button"))?;
         let line_toggle_button = doc
             .get_element_by_id("line-toggle")
             .ok_or_else(|| JsValue::from_str("missing line toggle button"))?;
-        let line_clear_button = doc
-            .get_element_by_id("line-clear")
-            .ok_or_else(|| JsValue::from_str("missing line clear button"))?;
+        let figure_trash_button = doc
+            .get_element_by_id("figure-trash")
+            .ok_or_else(|| JsValue::from_str("missing figure trash button"))?;
         let auto_fit_button = doc
             .get_element_by_id("auto-fit")
             .ok_or_else(|| JsValue::from_str("missing auto fit button"))?;
@@ -2997,6 +3439,7 @@ mod web_app {
         db_change_callback.forget();
 
         let chart_source_change_callback = Closure::wrap(Box::new(move || {
+            switch_pair_drawings(&current_pair_key());
             if let Err(err) = save_inputs() {
                 set_status(&format!("failed: {:?}", err));
                 return;
@@ -3034,13 +3477,12 @@ mod web_app {
 
             if event.key() == "Escape" {
                 event.prevent_default();
-                clear_fib_levels();
                 if let Err(err) = cancel_active_tools() {
                     set_status(&format!("failed: {:?}", err));
                     return;
                 }
-                set_status("Tools cancelled (Drag, Price %, Fib off)");
-                set_fib_popup_info("Tools cancelled. Click Fib to start again.");
+                set_status("Tools off (drawings kept — use the trash icons to clear)");
+                set_fib_popup_info("Tools off. Drawings kept. Click Fib to start again.");
                 spawn_local(async {
                     if let Err(err) = rerender_cached_or_fetch().await {
                         set_status(&format!("failed: {:?}", err));
@@ -3268,21 +3710,17 @@ mod web_app {
                 return;
             }
             if fib_enabled {
-                let has_anchor_a = FIB_STATE.with(|state| state.borrow().anchor_a.is_some());
-                let has_anchor_b = FIB_STATE.with(|state| state.borrow().anchor_b.is_some());
-                if has_anchor_a && has_anchor_b {
-                    set_status("Fib tool enabled");
-                    set_fib_popup_info("Fib restored. Click chart to start a new Fib.");
-                } else if has_anchor_a {
+                let has_draft = FIB_STATE.with(|state| state.borrow().draft.is_some());
+                if has_draft {
                     set_status("Fib tool: click second point");
-                    set_fib_popup_info("Fib restored. Click second point on chart.");
+                    set_fib_popup_info("Click the second point on the chart.");
                 } else {
-                    set_status("Fib tool: click first point, then second point");
-                    set_fib_popup_info("Fib is on. Click first point on chart.");
+                    set_status("Fib tool: click two points to add a fib");
+                    set_fib_popup_info("Fib is on. Click two points to add a fib.");
                 }
             } else {
                 set_status("Fib tool disabled");
-                set_fib_popup_info("Fib is off. Existing anchors preserved.");
+                set_fib_popup_info("Fib is off. Existing fibs preserved.");
             }
             spawn_local(async {
                 if let Err(err) = rerender_cached_or_fetch().await {
@@ -3296,23 +3734,6 @@ mod web_app {
             fib_toggle_callback.as_ref().unchecked_ref(),
         )?;
         fib_toggle_callback.forget();
-
-        let fib_clear_callback = Closure::wrap(Box::new(move || {
-            clear_fib_levels();
-            set_status("Fib levels cleared");
-            set_fib_popup_info("Fib anchors cleared. Click first point.");
-            spawn_local(async {
-                if let Err(err) = rerender_cached_or_fetch().await {
-                    set_status(&format!("failed: {:?}", err));
-                }
-            });
-        }) as Box<dyn FnMut()>);
-
-        fib_clear_button.add_event_listener_with_callback(
-            "click",
-            fib_clear_callback.as_ref().unchecked_ref(),
-        )?;
-        fib_clear_callback.forget();
 
         let line_toggle_callback = Closure::wrap(Box::new(move || {
             let next_enabled = LINE_TOOL_ENABLED.with(|state| {
@@ -3356,21 +3777,42 @@ mod web_app {
         )?;
         line_toggle_callback.forget();
 
-        let line_clear_callback = Closure::wrap(Box::new(move || {
-            clear_trend_lines();
-            set_status("Lines cleared");
-            spawn_local(async {
-                if let Err(err) = rerender_cached_or_fetch().await {
-                    set_status(&format!("failed: {:?}", err));
-                }
-            });
-        }) as Box<dyn FnMut()>);
-
-        line_clear_button.add_event_listener_with_callback(
+        let figure_trash_click_callback = Closure::wrap(Box::new(move |event: MouseEvent| {
+            event.stop_propagation();
+            if let Some(target) = FIGURE_TRASH_TARGET.with(|state| *state.borrow()) {
+                delete_figure(target);
+                set_status("Drawing deleted");
+            }
+            hide_figure_trash();
+            if let Err(err) = redraw_visible_chart_only() {
+                set_status(&format!("failed: {:?}", err));
+            }
+        }) as Box<dyn FnMut(MouseEvent)>);
+        figure_trash_button.add_event_listener_with_callback(
             "click",
-            line_clear_callback.as_ref().unchecked_ref(),
+            figure_trash_click_callback.as_ref().unchecked_ref(),
         )?;
-        line_clear_callback.forget();
+        figure_trash_click_callback.forget();
+
+        // Keep the icon up while the cursor is on it; restart the grace timer when
+        // the cursor leaves it.
+        let figure_trash_enter_callback = Closure::wrap(Box::new(move || {
+            cancel_figure_trash_timer();
+        }) as Box<dyn FnMut()>);
+        figure_trash_button.add_event_listener_with_callback(
+            "mouseenter",
+            figure_trash_enter_callback.as_ref().unchecked_ref(),
+        )?;
+        figure_trash_enter_callback.forget();
+
+        let figure_trash_leave_callback = Closure::wrap(Box::new(move || {
+            schedule_hide_figure_trash();
+        }) as Box<dyn FnMut()>);
+        figure_trash_button.add_event_listener_with_callback(
+            "mouseleave",
+            figure_trash_leave_callback.as_ref().unchecked_ref(),
+        )?;
+        figure_trash_leave_callback.forget();
 
         let auto_fit_callback = Closure::wrap(Box::new(move || {
             if let Err(err) = auto_fit_view() {
@@ -3765,6 +4207,7 @@ mod web_app {
                         need_fib_redraw = true;
                     }
                     set_fib_popup_info("Pan mode active. Release Shift to place Fib points.");
+                    hide_figure_trash();
                     hide_hover_tooltip();
                     hide_cursor_time_label();
                     hide_cursor_vline();
@@ -3793,6 +4236,7 @@ mod web_app {
                     } else {
                         hide_cursor_hline();
                     }
+                    hide_figure_trash();
                     hide_hover_tooltip();
                     hide_cursor_time_label();
                     hide_cursor_vline();
@@ -3840,6 +4284,7 @@ mod web_app {
                             set_hover_info(&format!("Price %: {label} | price {price_label}"));
                         }
                     }
+                    hide_figure_trash();
                     hide_hover_tooltip();
                     hide_cursor_time_label();
                     hide_cursor_vline();
@@ -3881,6 +4326,7 @@ mod web_app {
 
                 if is_chart_drag_mode {
                     set_chart_cursor("grabbing");
+                    hide_figure_trash();
                     hide_hover_tooltip();
                     hide_cursor_time_label();
                     hide_cursor_vline();
@@ -3903,6 +4349,7 @@ mod web_app {
                 }
 
                 if is_y_stretch_mode {
+                    hide_figure_trash();
                     hide_hover_tooltip();
                     hide_cursor_time_label();
                     hide_cursor_vline();
@@ -3923,6 +4370,7 @@ mod web_app {
                         }
                         set_hover_info("Hover chart to see candle time");
                         set_fib_popup_info("Move cursor inside chart plot area.");
+                        hide_figure_trash();
                         hide_hover_tooltip();
                         hide_cursor_time_label();
                         hide_cursor_vline();
@@ -3956,7 +4404,14 @@ mod web_app {
                     && !measure_enabled
                     && !DRAG_TOOL_ENABLED.with(|state| *state.borrow())
                 {
-                    fib_level_hit_test(crosshair_y as f64, plot_top, plot_bottom)
+                    fib_level_hit_test(
+                        crosshair_x as f64,
+                        crosshair_y as f64,
+                        plot_left,
+                        plot_right,
+                        plot_top,
+                        plot_bottom,
+                    )
                 } else {
                     None
                 };
@@ -3967,6 +4422,36 @@ mod web_app {
                     set_chart_cursor("move");
                 } else {
                     set_chart_cursor("default");
+                }
+
+                // Reveal a trash icon over the figure under the cursor (only when no
+                // tool is mid-use and we're not adjusting a fib level).
+                let tools_active = event.shift_key()
+                    || measure_enabled
+                    || fib_line_hover
+                    || DRAG_TOOL_ENABLED.with(|state| *state.borrow())
+                    || FIB_STATE.with(|state| state.borrow().enabled)
+                    || LINE_TOOL_ENABLED.with(|state| *state.borrow());
+                if tools_active {
+                    hide_figure_trash();
+                } else {
+                    match figure_hit_test(
+                        crosshair_x as f64,
+                        crosshair_y as f64,
+                        plot_left,
+                        plot_right,
+                        plot_top,
+                        plot_bottom,
+                    ) {
+                        Some((target, fx, fy)) => {
+                            cancel_figure_trash_timer();
+                            FIGURE_TRASH_TARGET.with(|state| {
+                                *state.borrow_mut() = Some(target);
+                            });
+                            position_figure_trash(canvas_left + fx, canvas_top + fy);
+                        }
+                        None => schedule_hide_figure_trash(),
+                    }
                 }
 
                 let tooltip_text = match snapped_candle {
@@ -3989,7 +4474,7 @@ mod web_app {
                 };
                 let fib_preview = FIB_STATE.with(|fib| {
                     let cfg = *fib.borrow();
-                    if cfg.enabled && cfg.anchor_a.is_some() && cfg.anchor_b.is_none() {
+                    if cfg.enabled && cfg.draft.is_some() {
                         Some((cursor_ts, usd_price))
                     } else {
                         None
@@ -4090,10 +4575,11 @@ mod web_app {
                 return;
             }
 
+            let offset_x = event.offset_x() as f64;
             let offset_y = event.offset_y() as f64;
             let fib_drag_level =
                 if !event.shift_key() && !DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
-                    fib_level_hit_test(offset_y, plot_top, plot_bottom)
+                    fib_level_hit_test(offset_x, offset_y, plot_left, plot_right, plot_top, plot_bottom)
                 } else {
                     None
                 };
@@ -4135,6 +4621,7 @@ mod web_app {
                         TREND_LINES.with(|state| {
                             state.borrow_mut().push((anchor, (cursor_ts, price)));
                         });
+                        persist_current_pair_drawings();
                         LINE_DRAFT_ANCHOR.with(|state| {
                             *state.borrow_mut() = None;
                         });
@@ -4171,36 +4658,43 @@ mod web_app {
                 let price = price_from_canvas_y(crosshair_y, plot_top, plot_bottom)
                     .unwrap_or_else(|| candles.last().map(|c| c.close).unwrap_or(0.0));
 
-                let (status_message, fib_completed) = FIB_STATE.with(|fib| {
-                    let mut cfg = fib.borrow_mut();
-                    if cfg.anchor_a.is_none() || cfg.anchor_b.is_some() {
-                        cfg.anchor_a = Some((cursor_ts, price));
-                        cfg.anchor_b = None;
-                        (
-                            format!(
-                                "Fib first point set: {} @ {:.2}. Click second point",
-                                unix_seconds_to_hover_text(cursor_ts),
-                                price
-                            ),
-                            false,
-                        )
-                    } else {
-                        cfg.anchor_b = Some((cursor_ts, price));
-                        cfg.enabled = false;
-                        let (anchor_ts, anchor_price) = cfg.anchor_a.unwrap();
-                        (
-                            format!(
-                                "Fib ready: {} @ {:.2} -> {} @ {:.2}",
-                                unix_seconds_to_hover_text(anchor_ts),
-                                anchor_price,
-                                unix_seconds_to_hover_text(cursor_ts),
-                                price
-                            ),
-                            true,
+                // First click sets the draft anchor; the second click finishes the
+                // fib, appends it, and leaves the tool on for the next one.
+                let draft = FIB_STATE.with(|fib| fib.borrow().draft);
+                let status_message = match draft {
+                    None => {
+                        FIB_STATE.with(|fib| {
+                            fib.borrow_mut().draft = Some((cursor_ts, price));
+                        });
+                        format!(
+                            "Fib first point set: {} @ {:.2}. Click second point",
+                            unix_seconds_to_hover_text(cursor_ts),
+                            price
                         )
                     }
-                });
+                    Some(anchor) => {
+                        FIB_LINES.with(|state| {
+                            state.borrow_mut().push((anchor, (cursor_ts, price)));
+                        });
+                        // Finish the fib and switch the tool off; re-enable it to
+                        // draw another.
+                        FIB_STATE.with(|fib| {
+                            let mut cfg = fib.borrow_mut();
+                            cfg.draft = None;
+                            cfg.enabled = false;
+                        });
+                        persist_current_pair_drawings();
+                        format!(
+                            "Fib drawn: {} @ {:.2} -> {} @ {:.2}",
+                            unix_seconds_to_hover_text(anchor.0),
+                            anchor.1,
+                            unix_seconds_to_hover_text(cursor_ts),
+                            price
+                        )
+                    }
+                };
 
+                let fib_completed = FIB_STATE.with(|fib| !fib.borrow().enabled);
                 if fib_completed {
                     if let Err(err) = sync_fib_button() {
                         set_status(&format!("failed: {:?}", err));
@@ -4343,6 +4837,7 @@ mod web_app {
                 set_chart_cursor("move");
             } else if let Some(level) = fib_line_drag_finished {
                 set_chart_cursor("default");
+                persist_current_pair_drawings();
                 if let Some(price) = finished_fib_level_price(level) {
                     let label = fib_level_drag_label(level);
                     set_status(&format!("{label} fixed at {:.2}", price));
@@ -4378,6 +4873,9 @@ mod web_app {
             });
             set_chart_cursor("default");
             set_hover_info("Hover chart to see candle time");
+            // Gentle hide so the cursor can travel onto the trash icon (which sits
+            // over the canvas) without it disappearing first.
+            schedule_hide_figure_trash();
             hide_hover_tooltip();
             hide_cursor_time_label();
             hide_cursor_vline();

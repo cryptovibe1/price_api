@@ -26,6 +26,23 @@ impl CandleRepository {
         row.try_get::<Option<i64>, _>("max_ts")
     }
 
+    pub async fn latest_candle(&self, pair: MarketPair) -> Result<Option<Candle>, sqlx::Error> {
+        let sql = format!(
+            "SELECT \
+                timestamp, \
+                open::DOUBLE PRECISION AS open, \
+                high::DOUBLE PRECISION AS high, \
+                low::DOUBLE PRECISION AS low, \
+                close::DOUBLE PRECISION AS close, \
+                volume::DOUBLE PRECISION AS volume \
+             FROM {} ORDER BY timestamp DESC LIMIT 1",
+            pair.table_name()
+        );
+        sqlx::query_as::<_, Candle>(&sql)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
     pub async fn insert_candles(
         &self,
         pair: MarketPair,

@@ -191,13 +191,20 @@ async fn watch_db_updates(
     repo: &CandleRepository,
     notifier: &Sender<CandleUpdateEvent>,
 ) {
-    let mut last_seen = match repo.latest_candle_ts(config.market_pair).await {
-        Ok(ts) => ts,
-        Err(err) => {
-            eprintln!("db watch init failed for {}: {}", db, err);
-            None
+    // Track the newest candle timestamp seen per pair so we only broadcast once a
+    // freshly inserted candle advances the table's latest row.
+    let mut last_seen: HashMap<MarketPair, i64> = HashMap::new();
+    for pair in MarketPair::ALL {
+        match repo.latest_candle(pair).await {
+            Ok(Some(candle)) => {
+                last_seen.insert(pair, candle.timestamp);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("db watch init failed for {} {}: {}", db, pair.table_name(), err);
+            }
         }
-    };
+    }
 
     let mut ticker = interval(config.worker_poll_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -205,26 +212,28 @@ async fn watch_db_updates(
     loop {
         ticker.tick().await;
 
-        match repo.latest_candle_ts(config.market_pair).await {
-            Ok(Some(latest_timestamp)) => {
-                let should_notify = last_seen
-                    .map(|previous| latest_timestamp > previous)
-                    .unwrap_or(false);
-                if should_notify {
-                    let inserted = last_seen
-                        .map(|previous| ((latest_timestamp - previous) / 60).max(1) as u64)
-                        .unwrap_or(1);
-                    let _ = notifier.send(CandleUpdateEvent {
-                        db: db.to_string(),
-                        latest_timestamp,
-                        inserted,
-                    });
+        for pair in MarketPair::ALL {
+            match repo.latest_candle(pair).await {
+                Ok(Some(candle)) => {
+                    let should_notify = last_seen
+                        .get(&pair)
+                        .map(|previous| candle.timestamp > *previous)
+                        .unwrap_or(true);
+                    if should_notify {
+                        let (base, quote) = pair.base_quote();
+                        let _ = notifier.send(CandleUpdateEvent {
+                            db: db.to_string(),
+                            base: base.to_string(),
+                            quote: quote.to_string(),
+                            candle: candle.clone(),
+                        });
+                    }
+                    last_seen.insert(pair, candle.timestamp);
                 }
-                last_seen = Some(latest_timestamp);
-            }
-            Ok(None) => {}
-            Err(err) => {
-                eprintln!("db watch poll failed for {}: {}", db, err);
+                Ok(None) => {}
+                Err(err) => {
+                    eprintln!("db watch poll failed for {} {}: {}", db, pair.table_name(), err);
+                }
             }
         }
     }

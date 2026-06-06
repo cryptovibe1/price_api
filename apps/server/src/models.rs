@@ -21,8 +21,9 @@ pub struct ErrorResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct CandleUpdateEvent {
     pub db: String,
-    pub latest_timestamp: i64,
-    pub inserted: u64,
+    pub base: String,
+    pub quote: String,
+    pub candle: Candle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -70,6 +71,15 @@ impl MarketPair {
             Self::EthUsd => "eth_usd",
             Self::SolUsd => "sol_usd",
             Self::XauUsd => "xau_usd",
+        }
+    }
+
+    pub fn base_quote(self) -> (&'static str, &'static str) {
+        match self {
+            Self::BtcUsd => ("btc", "usd"),
+            Self::EthUsd => ("eth", "usd"),
+            Self::SolUsd => ("sol", "usd"),
+            Self::XauUsd => ("xau", "usd"),
         }
     }
 

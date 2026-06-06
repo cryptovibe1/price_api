@@ -30,6 +30,9 @@ mod web_app {
     #[derive(Debug, Clone, Deserialize)]
     struct RealtimeUpdateEvent {
         db: String,
+        base: String,
+        quote: String,
+        candle: Candle,
     }
 
     thread_local! {
@@ -1884,6 +1887,69 @@ mod web_app {
         });
     }
 
+    // Fold a freshly inserted candle into LAST_CANDLES. Within the current
+    // aggregation bucket we extend high/low, carry the latest close and accumulate
+    // volume; once the candle crosses into a new bucket we append a fresh one
+    // aligned to the inferred spacing.
+    fn merge_live_candle(new: &Candle) {
+        LAST_CANDLES.with(|state| {
+            let mut candles = state.borrow_mut();
+            let spacing = inferred_candle_spacing(&candles);
+            match candles.last_mut() {
+                Some(last) if new.timestamp < last.timestamp => {
+                    // Stale or out-of-order candle; ignore.
+                }
+                Some(last) if new.timestamp < last.timestamp + spacing => {
+                    last.high = last.high.max(new.high);
+                    last.low = last.low.min(new.low);
+                    last.close = new.close;
+                    last.volume += new.volume;
+                }
+                Some(last) => {
+                    let bucket_ts =
+                        last.timestamp + ((new.timestamp - last.timestamp) / spacing) * spacing;
+                    candles.push(Candle {
+                        timestamp: bucket_ts,
+                        open: new.open,
+                        high: new.high,
+                        low: new.low,
+                        close: new.close,
+                        volume: new.volume,
+                    });
+                }
+                None => candles.push(new.clone()),
+            }
+        });
+    }
+
+    // Merge a live candle into the cached series and redraw, keeping the live edge
+    // in view if the chart was already following it.
+    async fn apply_live_candle_and_render(new: Candle) -> Result<(), JsValue> {
+        let prev_last_ts = LAST_CANDLES.with(|state| state.borrow().last().map(|c| c.timestamp));
+        merge_live_candle(&new);
+        let new_last_ts = LAST_CANDLES.with(|state| state.borrow().last().map(|c| c.timestamp));
+
+        // If a new bucket opened and the view was pinned to the old live edge,
+        // advance the view so the latest candle stays visible.
+        if let (Some(prev), Some(latest)) = (prev_last_ts, new_last_ts) {
+            if latest > prev {
+                if let Some((view_start, view_end)) = rendered_range() {
+                    if view_end >= prev {
+                        let span = (view_end - view_start).max(60);
+                        let next_end = latest;
+                        let next_start = next_end - span;
+                        CLIENT_VIEW_RANGE.with(|state| {
+                            *state.borrow_mut() = Some((next_start, next_end));
+                        });
+                        save_view_range(next_start, next_end);
+                    }
+                }
+            }
+        }
+
+        rerender_cached_or_fetch().await
+    }
+
     fn connect_realtime_ws() -> Result<(), JsValue> {
         disconnect_realtime_ws();
 
@@ -1900,17 +1966,43 @@ mod web_app {
             let Ok(update) = serde_json::from_str::<RealtimeUpdateEvent>(&text) else {
                 return;
             };
+            // Only react to updates for the database this socket subscribed to and
+            // that is still the active selection.
             if update.db != subscribed_db {
                 return;
             }
             if select_value("db").ok().as_deref() != Some(subscribed_db.as_str()) {
                 return;
             }
-            spawn_local(async {
-                if let Err(err) = rerender_cached_or_fetch().await {
-                    set_status(&format!("failed: {:?}", err));
-                }
-            });
+            // Only react to the pair(s) feeding the active chart source.
+            let Ok(chart_source) = select_value("chart-source") else {
+                return;
+            };
+            let Ok((num, den)) = chart_source_pairs(&chart_source) else {
+                return;
+            };
+            let event_pair = (update.base.as_str(), update.quote.as_str());
+            let matches_num = event_pair == num;
+            let matches_den = den.map(|d| event_pair == d).unwrap_or(false);
+            if !matches_num && !matches_den {
+                return;
+            }
+            if den.is_some() {
+                // Ratio charts combine two pairs, so a single-pair update can't be
+                // merged locally; refetch both legs to recompute the ratio.
+                spawn_local(async {
+                    if let Err(err) = fetch_and_draw().await {
+                        set_status(&format!("failed: {:?}", err));
+                    }
+                });
+            } else {
+                let candle = update.candle.clone();
+                spawn_local(async move {
+                    if let Err(err) = apply_live_candle_and_render(candle).await {
+                        set_status(&format!("failed: {:?}", err));
+                    }
+                });
+            }
         }) as Box<dyn FnMut(MessageEvent)>);
         let onerror = Closure::wrap(Box::new(move |_event: Event| {}) as Box<dyn FnMut(Event)>);
         let onclose = Closure::wrap(Box::new(move |_event: Event| {}) as Box<dyn FnMut(Event)>);

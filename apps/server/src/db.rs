@@ -20,6 +20,10 @@ impl CandleRepository {
         self.db
     }
 
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     pub async fn latest_candle_ts(&self, pair: MarketPair) -> Result<Option<i64>, sqlx::Error> {
         let sql = format!("SELECT MAX(timestamp) AS max_ts FROM {}", pair.table_name());
         let row: PgRow = sqlx::query(&sql).fetch_one(&self.pool).await?;
@@ -103,7 +107,7 @@ pub async fn connect_repositories(config: &AppConfig) -> HashMap<DbKind, CandleR
     repos
 }
 
-fn aggregation_sql(pair: MarketPair, period: Period) -> String {
+pub fn aggregation_sql(pair: MarketPair, period: Period) -> String {
     let table = pair.table_name();
     if let Some(bucket_seconds) = period.as_seconds() {
         return format!(
@@ -153,6 +157,102 @@ fn aggregation_sql(pair: MarketPair, period: Period) -> String {
             SUM(volume)::DOUBLE PRECISION AS volume
         FROM buckets
         GROUP BY month_bucket
+        ORDER BY timestamp
+        "
+    )
+}
+
+/// Generates SQL for a synthetic cross-rate pair (numerator / denominator).
+/// e.g. ETH/BTC = eth_usd prices divided by btc_usd prices, aligned to the same time bucket.
+pub fn virtual_pair_aggregation_sql(num: MarketPair, den: MarketPair, period: Period) -> String {
+    let num_t = num.table_name();
+    let den_t = den.table_name();
+
+    if let Some(bucket) = period.as_seconds() {
+        return format!(
+            "
+            WITH
+            num AS (
+                SELECT
+                    ((timestamp / {bucket}) * {bucket}) AS ts_b,
+                    (ARRAY_AGG(open  ORDER BY timestamp ASC ))[1] AS open,
+                    MAX(high) AS high,
+                    MIN(low)  AS low,
+                    (ARRAY_AGG(close ORDER BY timestamp DESC))[1] AS close
+                FROM {num_t}
+                WHERE timestamp BETWEEN $1 AND $2
+                GROUP BY 1
+            ),
+            den AS (
+                SELECT
+                    ((timestamp / {bucket}) * {bucket}) AS ts_b,
+                    (ARRAY_AGG(open  ORDER BY timestamp ASC ))[1] AS open,
+                    MAX(high) AS high,
+                    MIN(low)  AS low,
+                    (ARRAY_AGG(close ORDER BY timestamp DESC))[1] AS close
+                FROM {den_t}
+                WHERE timestamp BETWEEN $1 AND $2
+                GROUP BY 1
+            )
+            SELECT
+                num.ts_b::BIGINT                                        AS timestamp,
+                (num.open  / NULLIF(den.open,  0))::DOUBLE PRECISION    AS open,
+                (num.high  / NULLIF(den.low,   0))::DOUBLE PRECISION    AS high,
+                (num.low   / NULLIF(den.high,  0))::DOUBLE PRECISION    AS low,
+                (num.close / NULLIF(den.close, 0))::DOUBLE PRECISION    AS close,
+                0.0::DOUBLE PRECISION                                   AS volume
+            FROM num JOIN den ON num.ts_b = den.ts_b
+            ORDER BY 1
+            "
+        );
+    }
+
+    let month_size = period.size;
+    format!(
+        "
+        WITH
+        num_b AS (
+            SELECT timestamp, open, high, low, close,
+                (
+                    ((EXTRACT(YEAR  FROM TO_TIMESTAMP(timestamp))::INT * 12)
+                     + EXTRACT(MONTH FROM TO_TIMESTAMP(timestamp))::INT - 1)
+                    / {month_size}
+                ) * {month_size} AS mb
+            FROM {num_t} WHERE timestamp BETWEEN $1 AND $2
+        ),
+        den_b AS (
+            SELECT timestamp, open, high, low, close,
+                (
+                    ((EXTRACT(YEAR  FROM TO_TIMESTAMP(timestamp))::INT * 12)
+                     + EXTRACT(MONTH FROM TO_TIMESTAMP(timestamp))::INT - 1)
+                    / {month_size}
+                ) * {month_size} AS mb
+            FROM {den_t} WHERE timestamp BETWEEN $1 AND $2
+        ),
+        num_agg AS (
+            SELECT mb,
+                (ARRAY_AGG(open  ORDER BY timestamp ASC ))[1] AS open,
+                MAX(high) AS high, MIN(low) AS low,
+                (ARRAY_AGG(close ORDER BY timestamp DESC))[1] AS close
+            FROM num_b GROUP BY mb
+        ),
+        den_agg AS (
+            SELECT mb,
+                (ARRAY_AGG(open  ORDER BY timestamp ASC ))[1] AS open,
+                MAX(high) AS high, MIN(low) AS low,
+                (ARRAY_AGG(close ORDER BY timestamp DESC))[1] AS close
+            FROM den_b GROUP BY mb
+        )
+        SELECT
+            EXTRACT(EPOCH FROM MAKE_TIMESTAMP(
+                (num_agg.mb / 12), ((num_agg.mb % 12) + 1), 1, 0, 0, 0
+            ))::BIGINT                                                   AS timestamp,
+            (num_agg.open  / NULLIF(den_agg.open,  0))::DOUBLE PRECISION AS open,
+            (num_agg.high  / NULLIF(den_agg.low,   0))::DOUBLE PRECISION AS high,
+            (num_agg.low   / NULLIF(den_agg.high,  0))::DOUBLE PRECISION AS low,
+            (num_agg.close / NULLIF(den_agg.close, 0))::DOUBLE PRECISION AS close,
+            0.0::DOUBLE PRECISION                                        AS volume
+        FROM num_agg JOIN den_agg ON num_agg.mb = den_agg.mb
         ORDER BY timestamp
         "
     )

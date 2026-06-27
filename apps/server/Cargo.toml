@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "price-api-worker"
 path = "src/bin/worker.rs"
 
+[[bin]]
+name = "benchmark"
+path = "src/bin/benchmark.rs"
+
 [dependencies]
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

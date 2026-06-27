@@ -78,6 +78,7 @@ mod web_app {
         static FIGURE_TRASH_HIDE_TIMER: RefCell<Option<i32>> = const { RefCell::new(None) };
         static FIGURE_TRASH_HIDE_CLOSURE: RefCell<Option<Closure<dyn FnMut()>>> =
             const { RefCell::new(None) };
+        static CHART_FLIPPED: RefCell<bool> = const { RefCell::new(false) };
     }
 
     const STORAGE_KEY_API_BASE: &str = "price_api.api_base";
@@ -96,6 +97,7 @@ mod web_app {
     const STORAGE_KEY_VIEW_PERIOD: &str = "price_api.view_period";
     const STORAGE_KEY_FIB_PREFIX: &str = "price_api.fib.";
     const STORAGE_KEY_LINES_PREFIX: &str = "price_api.lines.";
+    const STORAGE_KEY_CHART_FLIPPED: &str = "price_api.chart_flipped";
     const MA_COUNT: usize = 15;
 
     #[derive(Clone, Copy)]
@@ -113,6 +115,7 @@ mod web_app {
         y_low: f64,
         y_high: f64,
         use_log_scale: bool,
+        flipped: bool,
     }
 
     #[derive(Clone, Copy)]
@@ -309,6 +312,80 @@ mod web_app {
         Ok(())
     }
 
+    fn sync_flip_button() -> Result<(), JsValue> {
+        let flipped = CHART_FLIPPED.with(|state| *state.borrow());
+        let doc = document()?;
+        let button = doc
+            .get_element_by_id("flip-chart")
+            .ok_or_else(|| JsValue::from_str("missing flip chart button"))?;
+        if flipped {
+            button.set_class_name("toggle-btn active");
+            button.set_attribute("aria-pressed", "true")?;
+        } else {
+            button.set_class_name("toggle-btn");
+            button.set_attribute("aria-pressed", "false")?;
+        }
+        Ok(())
+    }
+
+    fn format_price_short(price: f64) -> String {
+        if price >= 10_000.0 {
+            format!("{:.0}", price)
+        } else if price >= 100.0 {
+            format!("{:.2}", price)
+        } else {
+            format!("{:.4}", price)
+        }
+    }
+
+    fn sync_drawings_panel() {
+        let Ok(doc) = document() else { return };
+        let fibs = FIB_LINES.with(|state| state.borrow().clone());
+        let lines = TREND_LINES.with(|state| state.borrow().clone());
+
+        if let Some(fib_list) = doc.get_element_by_id("fib-list") {
+            if fibs.is_empty() {
+                fib_list.set_inner_html("<span class=\"drawings-empty\">None</span>");
+            } else {
+                let html: String = fibs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ((_, a_price), (_, b_price)))| {
+                        format!(
+                            "<div class=\"drawing-row\"><span class=\"drawing-label\">Fib {}: {} → {}</span><button class=\"drawing-delete\" data-fib-idx=\"{}\" type=\"button\">✕</button></div>",
+                            i + 1,
+                            format_price_short(*a_price),
+                            format_price_short(*b_price),
+                            i,
+                        )
+                    })
+                    .collect();
+                fib_list.set_inner_html(&html);
+            }
+        }
+
+        if let Some(lines_list) = doc.get_element_by_id("lines-list") {
+            if lines.is_empty() {
+                lines_list.set_inner_html("<span class=\"drawings-empty\">None</span>");
+            } else {
+                let html: String = lines
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ((_, a_price), (_, b_price)))| {
+                        format!(
+                            "<div class=\"drawing-row\"><span class=\"drawing-label\">Line {}: {} → {}</span><button class=\"drawing-delete\" data-line-idx=\"{}\" type=\"button\">✕</button></div>",
+                            i + 1,
+                            format_price_short(*a_price),
+                            format_price_short(*b_price),
+                            i,
+                        )
+                    })
+                    .collect();
+                lines_list.set_inner_html(&html);
+            }
+        }
+    }
+
     fn sync_fib_button() -> Result<(), JsValue> {
         let doc = document()?;
         let button = doc
@@ -488,9 +565,16 @@ mod web_app {
         });
     }
 
-    // chart-source select value, used as the key for per-pair drawing storage.
+    // chart-source select value + flip state, used as the key for per-pair drawing storage.
+    // Flipped and non-flipped charts keep independent drawing sets.
     fn current_pair_key() -> String {
-        select_value("chart-source").unwrap_or_default()
+        let pair = select_value("chart-source").unwrap_or_default();
+        let flipped = CHART_FLIPPED.with(|s| *s.borrow());
+        if flipped {
+            format!("{pair}_flipped")
+        } else {
+            pair
+        }
     }
 
     fn serialize_segments(segments: &[((i64, f64), (i64, f64))]) -> String {
@@ -570,6 +654,7 @@ mod web_app {
                 *state.borrow_mut() = lines;
             });
         }
+        sync_drawings_panel();
     }
 
     // Save the current pair's drawings then load the drawings belonging to
@@ -738,7 +823,7 @@ mod web_app {
 
         CHART_VIEW.with(|view| {
             let cfg = (*view.borrow())?;
-            if cfg.use_log_scale {
+            let ratio = if cfg.use_log_scale {
                 if cfg.y_low <= 0.0 || cfg.y_high <= 0.0 || price <= 0.0 {
                     return None;
                 }
@@ -747,17 +832,16 @@ mod web_app {
                 if high_ln <= low_ln {
                     return None;
                 }
-                let price_ln = price.ln();
-                let ratio = ((price_ln - low_ln) / (high_ln - low_ln)).clamp(0.0, 1.0);
-                Some(plot_bottom - ratio * (plot_bottom - plot_top))
+                ((price.ln() - low_ln) / (high_ln - low_ln)).clamp(0.0, 1.0)
             } else {
                 let span = cfg.y_high - cfg.y_low;
                 if span.abs() < f64::EPSILON {
                     return None;
                 }
-                let ratio = ((price - cfg.y_low) / span).clamp(0.0, 1.0);
-                Some(plot_bottom - ratio * (plot_bottom - plot_top))
-            }
+                ((price - cfg.y_low) / span).clamp(0.0, 1.0)
+            };
+            let effective_ratio = if cfg.flipped { 1.0 - ratio } else { ratio };
+            Some(plot_bottom - effective_ratio * (plot_bottom - plot_top))
         })
     }
 
@@ -1087,6 +1171,7 @@ mod web_app {
             }
         }
         persist_current_pair_drawings();
+        sync_drawings_panel();
     }
 
     fn position_figure_trash(container_x: f64, container_y: f64) {
@@ -1730,6 +1815,10 @@ mod web_app {
             set_checkbox_checked("log-scale", v == "1")?;
         }
         sync_log_scale_button()?;
+        if let Some(v) = storage.get_item(STORAGE_KEY_CHART_FLIPPED)? {
+            CHART_FLIPPED.with(|state| *state.borrow_mut() = v == "1");
+        }
+        sync_flip_button()?;
         for idx in 1..=MA_COUNT {
             let enabled_key = format!("price_api.ma{idx}.enabled");
             let period_key = format!("price_api.ma{idx}.period");
@@ -2276,6 +2365,7 @@ mod web_app {
             .ok_or_else(|| JsValue::from_str("missing rsi chart canvas"))?
             .dyn_into::<HtmlCanvasElement>()?;
 
+        sync_canvas_backing_size(&canvas);
         let backend = CanvasBackend::with_canvas_object(canvas)
             .ok_or_else(|| JsValue::from_str("rsi canvas backend error"))?;
         let root = backend.into_drawing_area();
@@ -2571,6 +2661,25 @@ mod web_app {
         Ok(())
     }
 
+    // Keep the canvas backing buffer (its `width`/`height` attributes, which is
+    // what plotters draws into) the same size CSS renders it at. Plotters measures
+    // its fixed pixel margins (16/36/72) against the buffer, while the mouse->time
+    // conversion measures those same margins against `client_width()`. If the two
+    // diverge -- the buffer is a fixed size and CSS stretches it -- a drawn line or
+    // price range lands offset from the cursor (shifted left when the rendered
+    // width is narrower than the buffer). Forcing buffer == client size keeps both
+    // coordinate spaces identical so figures land exactly where clicked.
+    fn sync_canvas_backing_size(canvas: &HtmlCanvasElement) {
+        let client_w = canvas.client_width();
+        let client_h = canvas.client_height();
+        if client_w > 0 && canvas.width() != client_w as u32 {
+            canvas.set_width(client_w as u32);
+        }
+        if client_h > 0 && canvas.height() != client_h as u32 {
+            canvas.set_height(client_h as u32);
+        }
+    }
+
     fn plot_bounds(canvas_width: f64, canvas_height: f64) -> Option<(f64, f64, f64, f64)> {
         if canvas_width <= 0.0 || canvas_height <= 0.0 {
             return None;
@@ -2620,10 +2729,11 @@ mod web_app {
             return None;
         }
 
-        let ratio = ((plot_bottom - offset_y) / (plot_bottom - plot_top)).clamp(0.0, 1.0);
+        let raw_ratio = ((plot_bottom - offset_y) / (plot_bottom - plot_top)).clamp(0.0, 1.0);
         CHART_VIEW.with(|view| {
             let v = *view.borrow();
             v.and_then(|cfg| {
+                let ratio = if cfg.flipped { 1.0 - raw_ratio } else { raw_ratio };
                 if cfg.use_log_scale {
                     if cfg.y_low <= 0.0 || cfg.y_high <= 0.0 {
                         return None;
@@ -2731,6 +2841,7 @@ mod web_app {
             .ok_or_else(|| JsValue::from_str("missing chart canvas"))?
             .dyn_into::<HtmlCanvasElement>()?;
 
+        sync_canvas_backing_size(&canvas);
         let backend = CanvasBackend::with_canvas_object(canvas)
             .ok_or_else(|| JsValue::from_str("canvas backend error"))?;
         let root = backend.into_drawing_area();
@@ -2831,6 +2942,7 @@ mod web_app {
                 center + half_span + pan_offset,
             )
         };
+        let chart_flipped = CHART_FLIPPED.with(|state| *state.borrow());
         CHART_VIEW.with(|view| {
             *view.borrow_mut() = Some(ChartView {
                 x_start,
@@ -2838,6 +2950,7 @@ mod web_app {
                 y_low,
                 y_high,
                 use_log_scale,
+                flipped: chart_flipped,
             });
         });
         // Compute moving averages over the full loaded dataset rather than the
@@ -2884,7 +2997,14 @@ mod web_app {
                 .margin(16)
                 .x_label_area_size(36)
                 .y_label_area_size(72)
-                .build_cartesian_2d(x_start..x_end, (y_low..y_high).log_scale())
+                .build_cartesian_2d(
+                    x_start..x_end,
+                    if chart_flipped {
+                        (y_high..y_low).log_scale()
+                    } else {
+                        (y_low..y_high).log_scale()
+                    },
+                )
                 .map_err(|e| JsValue::from_str(&format!("chart build error: {e}")))?;
 
             chart
@@ -3076,7 +3196,10 @@ mod web_app {
                 .margin(16)
                 .x_label_area_size(36)
                 .y_label_area_size(72)
-                .build_cartesian_2d(x_start..x_end, y_low..y_high)
+                .build_cartesian_2d(
+                    x_start..x_end,
+                    if chart_flipped { y_high..y_low } else { y_low..y_high },
+                )
                 .map_err(|e| JsValue::from_str(&format!("chart build error: {e}")))?;
 
             chart
@@ -3497,6 +3620,15 @@ mod web_app {
         let auto_fit_button = doc
             .get_element_by_id("auto-fit")
             .ok_or_else(|| JsValue::from_str("missing auto fit button"))?;
+        let flip_chart_button = doc
+            .get_element_by_id("flip-chart")
+            .ok_or_else(|| JsValue::from_str("missing flip chart button"))?;
+        let fib_list_container = doc
+            .get_element_by_id("fib-list")
+            .ok_or_else(|| JsValue::from_str("missing fib list"))?;
+        let lines_list_container = doc
+            .get_element_by_id("lines-list")
+            .ok_or_else(|| JsValue::from_str("missing lines list"))?;
         let fib_popup = doc
             .get_element_by_id("fib-popup")
             .ok_or_else(|| JsValue::from_str("missing fib popup"))?
@@ -3996,6 +4128,83 @@ mod web_app {
             auto_fit_callback.as_ref().unchecked_ref(),
         )?;
         auto_fit_callback.forget();
+
+        let flip_callback = Closure::wrap(Box::new(move || {
+            // Persist drawings under the pre-flip key before toggling.
+            persist_current_pair_drawings();
+            let next = CHART_FLIPPED.with(|state| {
+                let mut val = state.borrow_mut();
+                *val = !*val;
+                *val
+            });
+            if let Ok(storage) = storage() {
+                let _ = storage.set_item(STORAGE_KEY_CHART_FLIPPED, if next { "1" } else { "0" });
+            }
+            // Load drawings for the new flip-qualified key.
+            let new_key = current_pair_key();
+            load_pair_drawings(&new_key);
+            CURRENT_PAIR_KEY.with(|cur| {
+                *cur.borrow_mut() = new_key;
+            });
+            if let Err(err) = sync_flip_button() {
+                set_status(&format!("failed: {:?}", err));
+                return;
+            }
+            spawn_local(async {
+                if let Err(err) = rerender_cached_or_fetch().await {
+                    set_status(&format!("failed: {:?}", err));
+                }
+            });
+        }) as Box<dyn FnMut()>);
+        flip_chart_button.add_event_listener_with_callback(
+            "click",
+            flip_callback.as_ref().unchecked_ref(),
+        )?;
+        flip_callback.forget();
+
+        let fib_list_click = Closure::wrap(Box::new(move |event: MouseEvent| {
+            let target = match event.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
+                Some(el) => el,
+                None => return,
+            };
+            if let Some(idx_str) = target.get_attribute("data-fib-idx") {
+                if let Ok(idx) = idx_str.parse::<usize>() {
+                    delete_figure(FigureTarget::Fib(idx));
+                    spawn_local(async {
+                        if let Err(err) = rerender_cached_or_fetch().await {
+                            set_status(&format!("failed: {:?}", err));
+                        }
+                    });
+                }
+            }
+        }) as Box<dyn FnMut(MouseEvent)>);
+        fib_list_container.add_event_listener_with_callback(
+            "click",
+            fib_list_click.as_ref().unchecked_ref(),
+        )?;
+        fib_list_click.forget();
+
+        let lines_list_click = Closure::wrap(Box::new(move |event: MouseEvent| {
+            let target = match event.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
+                Some(el) => el,
+                None => return,
+            };
+            if let Some(idx_str) = target.get_attribute("data-line-idx") {
+                if let Ok(idx) = idx_str.parse::<usize>() {
+                    delete_figure(FigureTarget::TrendLine(idx));
+                    spawn_local(async {
+                        if let Err(err) = rerender_cached_or_fetch().await {
+                            set_status(&format!("failed: {:?}", err));
+                        }
+                    });
+                }
+            }
+        }) as Box<dyn FnMut(MouseEvent)>);
+        lines_list_container.add_event_listener_with_callback(
+            "click",
+            lines_list_click.as_ref().unchecked_ref(),
+        )?;
+        lines_list_click.forget();
 
         let fib_drag_popup = fib_popup.clone();
         let fib_drag_start_callback = Closure::wrap(Box::new(move |event: MouseEvent| {
@@ -4793,6 +5002,7 @@ mod web_app {
                             state.borrow_mut().push((anchor, (cursor_ts, price)));
                         });
                         persist_current_pair_drawings();
+                        sync_drawings_panel();
                         LINE_DRAFT_ANCHOR.with(|state| {
                             *state.borrow_mut() = None;
                         });
@@ -4855,6 +5065,7 @@ mod web_app {
                             cfg.enabled = false;
                         });
                         persist_current_pair_drawings();
+                        sync_drawings_panel();
                         format!(
                             "Fib drawn: {} @ {:.2} -> {} @ {:.2}",
                             unix_seconds_to_hover_text(anchor.0),
@@ -5009,6 +5220,7 @@ mod web_app {
             } else if let Some(level) = fib_line_drag_finished {
                 set_chart_cursor("default");
                 persist_current_pair_drawings();
+                sync_drawings_panel();
                 if let Some(price) = finished_fib_level_price(level) {
                     let label = fib_level_drag_label(level);
                     set_status(&format!("{label} fixed at {:.2}", price));

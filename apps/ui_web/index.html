@@ -314,7 +314,8 @@
       }
 
       .controls #log-scale-toggle,
-      .controls #auto-fit {
+      .controls #auto-fit,
+      .controls #flip-chart {
         margin-top: 0;
         white-space: nowrap;
       }
@@ -397,7 +398,8 @@
         stroke-linejoin: round;
       }
 
-      #auto-fit {
+      #auto-fit,
+      #flip-chart {
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -407,7 +409,14 @@
         border: 1px solid var(--line);
       }
 
-      #auto-fit svg {
+      #flip-chart.active {
+        background: linear-gradient(180deg, #3e8ce6, #2f7dd8);
+        color: #ffffff;
+        border-color: transparent;
+      }
+
+      #auto-fit svg,
+      #flip-chart svg {
         width: 18px;
         height: 18px;
         stroke: currentColor;
@@ -415,6 +424,69 @@
         stroke-width: 1.8;
         stroke-linecap: round;
         stroke-linejoin: round;
+      }
+
+      .drawings-body {
+        padding: 8px 10px 10px 10px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .drawings-section-title {
+        font-size: 11px;
+        font-weight: 700;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        margin-bottom: 4px;
+      }
+
+      .drawing-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 6px;
+        font-size: 12px;
+        color: var(--text);
+        padding: 3px 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .drawing-row:last-child {
+        border-bottom: none;
+      }
+
+      .drawing-label {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .drawing-delete {
+        flex: 0 0 auto;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #fff;
+        color: #e5484d;
+        font-size: 11px;
+        padding: 2px 6px;
+        cursor: pointer;
+        line-height: 1.4;
+      }
+
+      .drawing-delete:hover {
+        background: #e5484d;
+        color: #fff;
+        border-color: transparent;
+      }
+
+      .drawings-empty {
+        font-size: 12px;
+        color: var(--muted);
+        font-style: italic;
       }
 
       .controls #load {
@@ -934,6 +1006,22 @@
         </div>
       </div>
 
+          <div id="drawings-card" class="panel">
+            <div class="settings-head">
+              <div class="settings-title">Drawings</div>
+            </div>
+            <div class="drawings-body">
+              <div>
+                <div class="drawings-section-title">Fibonacci</div>
+                <div id="fib-list"><span class="drawings-empty">None</span></div>
+              </div>
+              <div>
+                <div class="drawings-section-title">Lines</div>
+                <div id="lines-list"><span class="drawings-empty">None</span></div>
+              </div>
+            </div>
+          </div>
+
         </aside>
 
         <main class="main-col">
@@ -1002,6 +1090,23 @@
                 <path d="M21 9V3h-6" />
                 <path d="M3 15v6h6" />
                 <path d="M21 15v6h-6" />
+              </svg>
+            </button>
+          </div>
+          <div>
+            <label for="flip-chart">Flip</label>
+            <button
+              id="flip-chart"
+              class="toggle-btn"
+              type="button"
+              aria-label="Flip chart"
+              title="Flip chart (invert Y axis)"
+              aria-pressed="false"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M3 12h18" />
+                <path d="m8 7-5 5 5 5" />
+                <path d="m16 7 5 5-5 5" />
               </svg>
             </button>
           </div>

@@ -2554,10 +2554,7 @@ mod web_app {
         let mut span = (end - start).max(60);
 
         if let Some((min_ts, _max_ts)) = loaded_bounds() {
-            let max_future_ts = (Date::now() / 1000.0) as i64 + loaded_candle_spacing() * 300;
-            let available_span = (max_future_ts - min_ts).max(60);
-            span = span.min(available_span);
-            start = start.clamp(min_ts, max_future_ts - span);
+            start = start.max(min_ts);
             end = start + span;
         } else {
             end = start + span;

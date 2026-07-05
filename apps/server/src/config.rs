@@ -57,7 +57,7 @@ impl AppConfig {
         }
 
         match self.market_pair {
-            MarketPair::SolUsd => 1_586_390_400,
+            MarketPair::SolUsd | MarketPair::SolBtc => 1_586_390_400,
             MarketPair::BtcUsd | MarketPair::EthUsd | MarketPair::XauUsd => {
                 now_secs - self.bootstrap_lookback_minutes * 60
             }

@@ -32,14 +32,16 @@ pub enum MarketPair {
     EthUsd,
     SolUsd,
     XauUsd,
+    SolBtc,
 }
 
 impl MarketPair {
-    pub const ALL: [MarketPair; 4] = [
+    pub const ALL: [MarketPair; 5] = [
         MarketPair::BtcUsd,
         MarketPair::EthUsd,
         MarketPair::SolUsd,
         MarketPair::XauUsd,
+        MarketPair::SolBtc,
     ];
 
     pub fn from_base_quote(base: &str, quote: &str) -> Result<Self, &'static str> {
@@ -51,7 +53,8 @@ impl MarketPair {
             ("eth", "usd") => Ok(Self::EthUsd),
             ("sol", "usd") => Ok(Self::SolUsd),
             ("xau", "usd") | ("xaut", "usdt") => Ok(Self::XauUsd),
-            _ => Err("pair must be one of: btc/usd, eth/usd, sol/usd, xau/usd, xaut/usdt"),
+            ("sol", "btc") => Ok(Self::SolBtc),
+            _ => Err("pair must be one of: btc/usd, eth/usd, sol/usd, xau/usd, sol/btc"),
         }
     }
 
@@ -61,7 +64,8 @@ impl MarketPair {
             "ETHUSDT" => Ok(Self::EthUsd),
             "SOLUSDT" => Ok(Self::SolUsd),
             "XAUTUSDT" => Ok(Self::XauUsd),
-            _ => Err("REALTIME_SYMBOL must be one of: BTCUSDT, ETHUSDT, SOLUSDT, XAUTUSDT"),
+            "SOLBTC" => Ok(Self::SolBtc),
+            _ => Err("REALTIME_SYMBOL must be one of: BTCUSDT, ETHUSDT, SOLUSDT, XAUTUSDT, SOLBTC"),
         }
     }
 
@@ -71,6 +75,7 @@ impl MarketPair {
             Self::EthUsd => "eth_usd",
             Self::SolUsd => "sol_usd",
             Self::XauUsd => "xau_usd",
+            Self::SolBtc => "sol_btc",
         }
     }
 
@@ -80,6 +85,7 @@ impl MarketPair {
             Self::EthUsd => ("eth", "usd"),
             Self::SolUsd => ("sol", "usd"),
             Self::XauUsd => ("xau", "usd"),
+            Self::SolBtc => ("sol", "btc"),
         }
     }
 
@@ -89,6 +95,7 @@ impl MarketPair {
             Self::EthUsd => "ETHUSDT",
             Self::SolUsd => "SOLUSDT",
             Self::XauUsd => "XAUTUSDT",
+            Self::SolBtc => "SOLBTC",
         }
     }
 }

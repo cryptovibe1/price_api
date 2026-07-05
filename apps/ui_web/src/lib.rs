@@ -43,7 +43,8 @@ mod web_app {
         static PAN_LAST_X: RefCell<Option<i32>> = const { RefCell::new(None) };
         static DRAG_PAN_REMAINDER: RefCell<f64> = const { RefCell::new(0.0) };
         static WHEEL_PAN_REMAINDER: RefCell<f64> = const { RefCell::new(0.0) };
-        static DRAG_TOOL_ENABLED: RefCell<bool> = const { RefCell::new(false) };
+        static STRETCH_TOOL_ENABLED: RefCell<bool> = const { RefCell::new(false) };
+        static AUTO_MODE_ENABLED: RefCell<bool> = const { RefCell::new(false) };
         static CHART_DRAG: RefCell<Option<ChartDragState>> = const { RefCell::new(None) };
         static MEASURE_STATE: RefCell<MeasureState> = const { RefCell::new(MeasureState::new()) };
         static Y_STRETCH_FACTOR: RefCell<f64> = const { RefCell::new(1.0) };
@@ -406,25 +407,47 @@ mod web_app {
         Ok(())
     }
 
-    fn sync_drag_button() -> Result<(), JsValue> {
+    fn sync_stretch_button() -> Result<(), JsValue> {
         let doc = document()?;
         let button = doc
-            .get_element_by_id("drag-toggle")
-            .ok_or_else(|| JsValue::from_str("missing drag toggle button"))?;
+            .get_element_by_id("stretch-toggle")
+            .ok_or_else(|| JsValue::from_str("missing stretch toggle button"))?;
 
-        let enabled = DRAG_TOOL_ENABLED.with(|state| *state.borrow());
+        let enabled = STRETCH_TOOL_ENABLED.with(|state| *state.borrow());
         if enabled {
             button.set_class_name("toggle-btn active");
             button.set_attribute("aria-pressed", "true")?;
-            button.set_attribute("aria-label", "Drag On")?;
-            button.set_attribute("title", "Drag On")?;
-            set_chart_cursor("move");
+            button.set_attribute("aria-label", "Stretch On")?;
+            button.set_attribute("title", "Stretch On")?;
+            set_chart_cursor("ns-resize");
         } else {
             button.set_class_name("toggle-btn");
             button.set_attribute("aria-pressed", "false")?;
-            button.set_attribute("aria-label", "Drag Off")?;
-            button.set_attribute("title", "Drag Off")?;
-            set_chart_cursor("default");
+            button.set_attribute("aria-label", "Stretch Off")?;
+            button.set_attribute("title", "Stretch Off")?;
+            set_chart_cursor("grab");
+        }
+
+        Ok(())
+    }
+
+    fn sync_auto_mode_button() -> Result<(), JsValue> {
+        let doc = document()?;
+        let button = doc
+            .get_element_by_id("auto-mode-toggle")
+            .ok_or_else(|| JsValue::from_str("missing auto mode toggle button"))?;
+
+        let enabled = AUTO_MODE_ENABLED.with(|state| *state.borrow());
+        if enabled {
+            button.set_class_name("toggle-btn active");
+            button.set_attribute("aria-pressed", "true")?;
+            button.set_attribute("aria-label", "Auto On")?;
+            button.set_attribute("title", "Auto On")?;
+        } else {
+            button.set_class_name("toggle-btn");
+            button.set_attribute("aria-pressed", "false")?;
+            button.set_attribute("aria-label", "Auto Off")?;
+            button.set_attribute("title", "Auto Off")?;
         }
 
         Ok(())
@@ -452,11 +475,11 @@ mod web_app {
         Ok(())
     }
 
-    // Turn off the interactive chart tools (Drag, Price %, Fib, Line) without
+    // Turn off the interactive chart tools (Stretch, Price %, Fib, Line) without
     // discarding their finished drawings. Used by the Escape key to deactivate
     // whatever tool is on while keeping the fib, lines and price range on screen.
     fn cancel_active_tools() -> Result<(), JsValue> {
-        DRAG_TOOL_ENABLED.with(|state| {
+        STRETCH_TOOL_ENABLED.with(|state| {
             *state.borrow_mut() = false;
         });
         MEASURE_STATE.with(|state| {
@@ -481,17 +504,17 @@ mod web_app {
         LINE_PREVIEW_POINT.with(|state| {
             *state.borrow_mut() = None;
         });
-        sync_drag_button()?;
+        sync_stretch_button()?;
         sync_measure_button()?;
         sync_fib_button()?;
         sync_line_button()?;
         Ok(())
     }
 
-    // Disable the other interactive tools (Drag, Price %, Fib) when the line
+    // Disable the other interactive tools (Stretch, Price %, Fib) when the line
     // tool is turned on, mirroring how the Fib toggle clears the rest.
     fn disable_tools_for_line() -> Result<(), JsValue> {
-        DRAG_TOOL_ENABLED.with(|state| {
+        STRETCH_TOOL_ENABLED.with(|state| {
             *state.borrow_mut() = false;
         });
         MEASURE_STATE.with(|state| {
@@ -510,7 +533,7 @@ mod web_app {
             state.borrow_mut().enabled = false;
         });
         let _ = set_fib_preview_point(None);
-        sync_drag_button()?;
+        sync_stretch_button()?;
         sync_measure_button()?;
         sync_fib_button()?;
         Ok(())
@@ -919,6 +942,11 @@ mod web_app {
     }
 
     fn redraw_visible_chart_only() -> Result<(), JsValue> {
+        if AUTO_MODE_ENABLED.with(|s| *s.borrow()) {
+            Y_STRETCH_FACTOR.with(|s| *s.borrow_mut() = 1.0);
+            Y_PAN_LINEAR_OFFSET.with(|s| *s.borrow_mut() = 0.0);
+            Y_PAN_LOG_OFFSET.with(|s| *s.borrow_mut() = 0.0);
+        }
         let candles = LAST_RENDERED_CANDLES.with(|state| state.borrow().clone());
         if candles.is_empty() {
             return Ok(());
@@ -1963,7 +1991,7 @@ mod web_app {
             "sol_usd" => Ok((("sol", "usd"), None)),
             "xau_usd" => Ok((("xau", "usd"), None)),
             "eth_btc" => Ok((("eth", "usd"), Some(("btc", "usd")))),
-            "sol_btc" => Ok((("sol", "usd"), Some(("btc", "usd")))),
+            "sol_btc" => Ok((("sol", "btc"), None)),
             "btc_xau" => Ok((("btc", "usd"), Some(("xau", "usd")))),
             "sol_eth" => Ok((("sol", "usd"), Some(("eth", "usd")))),
             _ => Err(JsValue::from_str(
@@ -2618,6 +2646,11 @@ mod web_app {
     }
 
     fn apply_range_change_client_only(ts_start: i64, ts_end: i64) -> Result<(), JsValue> {
+        if AUTO_MODE_ENABLED.with(|s| *s.borrow()) {
+            Y_STRETCH_FACTOR.with(|s| *s.borrow_mut() = 1.0);
+            Y_PAN_LINEAR_OFFSET.with(|s| *s.borrow_mut() = 0.0);
+            Y_PAN_LOG_OFFSET.with(|s| *s.borrow_mut() = 0.0);
+        }
         let (new_start, new_end) = clamp_range_to_loaded(ts_start, ts_end);
         CLIENT_VIEW_RANGE.with(|state| {
             *state.borrow_mut() = Some((new_start, new_end));
@@ -2909,21 +2942,18 @@ mod web_app {
         let y_max_log = raw_y_max;
 
         let y_span_linear = (y_max_linear - y_min_linear).abs();
-        let y_pad_linear = (y_span_linear * 0.06).max(1.0);
-        let y_span_log = (y_max_log - y_min_log).abs();
-        let y_pad_log = (y_span_log * 0.06).max(1.0);
+        let y_pad_linear = y_span_linear * 0.06;
 
         let use_log_scale = log_scale && y_min_log > 0.0;
         let stretch_factor = Y_STRETCH_FACTOR
             .with(|state| *state.borrow())
             .clamp(0.2, 25.0);
         let (y_low, y_high) = if use_log_scale {
-            let base_low = y_min_log;
-            let base_high = y_max_log + y_pad_log;
-            let low_ln = base_low.ln();
-            let high_ln = base_high.ln();
+            let low_ln = y_min_log.ln();
+            let high_ln = y_max_log.ln();
             let center_ln = (low_ln + high_ln) / 2.0;
-            let half_span_ln = ((high_ln - low_ln) / 2.0) * stretch_factor;
+            // padding and stretch applied in log space — scale-independent
+            let half_span_ln = ((high_ln - low_ln).abs() / 2.0).max(0.02) * 1.06 * stretch_factor;
             let pan_offset_ln = Y_PAN_LOG_OFFSET.with(|state| *state.borrow());
             let low = center_ln - half_span_ln + pan_offset_ln;
             let high = center_ln + half_span_ln + pan_offset_ln;
@@ -3562,7 +3592,8 @@ mod web_app {
             }
         });
         sync_fib_button()?;
-        sync_drag_button()?;
+        sync_stretch_button()?;
+        sync_auto_mode_button()?;
         sync_measure_button()?;
         set_fib_popup_info("Move cursor over chart to use Fibonacci tool");
 
@@ -3599,9 +3630,9 @@ mod web_app {
         let log_scale_toggle_button = doc
             .get_element_by_id("log-scale-toggle")
             .ok_or_else(|| JsValue::from_str("missing log scale toggle button"))?;
-        let drag_toggle_button = doc
-            .get_element_by_id("drag-toggle")
-            .ok_or_else(|| JsValue::from_str("missing drag toggle button"))?;
+        let stretch_toggle_button = doc
+            .get_element_by_id("stretch-toggle")
+            .ok_or_else(|| JsValue::from_str("missing stretch toggle button"))?;
         let measure_toggle_button = doc
             .get_element_by_id("measure-toggle")
             .ok_or_else(|| JsValue::from_str("missing measure toggle button"))?;
@@ -3617,6 +3648,9 @@ mod web_app {
         let auto_fit_button = doc
             .get_element_by_id("auto-fit")
             .ok_or_else(|| JsValue::from_str("missing auto fit button"))?;
+        let auto_mode_toggle_button = doc
+            .get_element_by_id("auto-mode-toggle")
+            .ok_or_else(|| JsValue::from_str("missing auto mode toggle button"))?;
         let flip_chart_button = doc
             .get_element_by_id("flip-chart")
             .ok_or_else(|| JsValue::from_str("missing flip chart button"))?;
@@ -3857,8 +3891,8 @@ mod web_app {
         )?;
         log_scale_callback.forget();
 
-        let drag_toggle_callback = Closure::wrap(Box::new(move || {
-            let next_enabled = DRAG_TOOL_ENABLED.with(|state| {
+        let stretch_toggle_callback = Closure::wrap(Box::new(move || {
+            let next_enabled = STRETCH_TOOL_ENABLED.with(|state| {
                 let mut enabled = state.borrow_mut();
                 *enabled = !*enabled;
                 *enabled
@@ -3892,23 +3926,23 @@ mod web_app {
                     set_status(&format!("failed: {:?}", err));
                     return;
                 }
-                set_status("Drag tool enabled");
-                set_fib_popup_info("Drag chart to pan X and Y axes.");
+                set_status("Stretch mode: drag up/down to zoom Y axis");
+                set_fib_popup_info("Stretch mode on. Drag up/down to zoom Y axis.");
             } else {
-                set_status("Drag tool disabled");
+                set_status("Drag mode active (default)");
                 set_fib_popup_info("Move cursor over chart to use Fibonacci tool");
             }
-            if let Err(err) = sync_drag_button() {
+            if let Err(err) = sync_stretch_button() {
                 set_status(&format!("failed: {:?}", err));
                 return;
             }
         }) as Box<dyn FnMut()>);
 
-        drag_toggle_button.add_event_listener_with_callback(
+        stretch_toggle_button.add_event_listener_with_callback(
             "click",
-            drag_toggle_callback.as_ref().unchecked_ref(),
+            stretch_toggle_callback.as_ref().unchecked_ref(),
         )?;
-        drag_toggle_callback.forget();
+        stretch_toggle_callback.forget();
 
         let measure_toggle_callback = Closure::wrap(Box::new(move || {
             let next_enabled = MEASURE_STATE.with(|state| {
@@ -3930,7 +3964,7 @@ mod web_app {
                 FIB_STATE.with(|state| {
                     state.borrow_mut().enabled = false;
                 });
-                DRAG_TOOL_ENABLED.with(|state| {
+                STRETCH_TOOL_ENABLED.with(|state| {
                     *state.borrow_mut() = false;
                 });
                 let _ = set_fib_preview_point(None);
@@ -3938,7 +3972,7 @@ mod web_app {
                     set_status(&format!("failed: {:?}", err));
                     return;
                 }
-                if let Err(err) = sync_drag_button() {
+                if let Err(err) = sync_stretch_button() {
                     set_status(&format!("failed: {:?}", err));
                     return;
                 }
@@ -3973,7 +4007,7 @@ mod web_app {
             });
             let fib_enabled = FIB_STATE.with(|state| state.borrow().enabled);
             if fib_enabled {
-                DRAG_TOOL_ENABLED.with(|state| {
+                STRETCH_TOOL_ENABLED.with(|state| {
                     *state.borrow_mut() = false;
                 });
                 MEASURE_STATE.with(|state| {
@@ -3988,7 +4022,7 @@ mod web_app {
                 MEASURE_DRAG_PRICE.with(|state| {
                     *state.borrow_mut() = None;
                 });
-                if let Err(err) = sync_drag_button() {
+                if let Err(err) = sync_stretch_button() {
                     set_status(&format!("failed: {:?}", err));
                     return;
                 }
@@ -4125,6 +4159,33 @@ mod web_app {
             auto_fit_callback.as_ref().unchecked_ref(),
         )?;
         auto_fit_callback.forget();
+
+        let auto_mode_callback = Closure::wrap(Box::new(move || {
+            let next_enabled = AUTO_MODE_ENABLED.with(|state| {
+                let mut val = state.borrow_mut();
+                *val = !*val;
+                *val
+            });
+            if let Err(err) = sync_auto_mode_button() {
+                set_status(&format!("failed: {:?}", err));
+                return;
+            }
+            if next_enabled {
+                if let Err(err) = redraw_visible_chart_only() {
+                    set_status(&format!("failed: {:?}", err));
+                    return;
+                }
+                set_status("Auto mode on: Y axis fits visible candles");
+            } else {
+                set_status("Auto mode off");
+            }
+        }) as Box<dyn FnMut()>);
+
+        auto_mode_toggle_button.add_event_listener_with_callback(
+            "click",
+            auto_mode_callback.as_ref().unchecked_ref(),
+        )?;
+        auto_mode_callback.forget();
 
         let flip_callback = Closure::wrap(Box::new(move || {
             // Persist drawings under the pre-flip key before toggling.
@@ -4484,23 +4545,18 @@ mod web_app {
             FIB_POPUP_DRAG.with(|state| {
                 *state.borrow_mut() = None;
             });
-            let chart_drag_finished = CHART_DRAG.with(|state| state.borrow_mut().take().is_some());
-            Y_STRETCH_DRAG.with(|state| {
-                *state.borrow_mut() = None;
-            });
-            if chart_drag_finished && DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
-                DRAG_TOOL_ENABLED.with(|state| {
+            CHART_DRAG.with(|state| state.borrow_mut().take());
+            let stretch_finished = Y_STRETCH_DRAG.with(|state| state.borrow_mut().take()).is_some();
+            if stretch_finished {
+                STRETCH_TOOL_ENABLED.with(|state| {
                     *state.borrow_mut() = false;
                 });
-                if let Err(err) = sync_drag_button() {
-                    set_status(&format!("failed: {:?}", err));
-                } else {
-                    set_status("Drag tool disabled after pan");
-                }
-            } else if DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
-                set_chart_cursor("move");
+                let _ = sync_stretch_button();
+                set_status("Drag mode active (default)");
+            } else if STRETCH_TOOL_ENABLED.with(|state| *state.borrow()) {
+                set_chart_cursor("ns-resize");
             } else {
-                set_chart_cursor("default");
+                set_chart_cursor("grab");
             }
         }) as Box<dyn FnMut(MouseEvent)>);
 
@@ -4779,7 +4835,7 @@ mod web_app {
 
                 let fib_hover_level = if !event.shift_key()
                     && !measure_enabled
-                    && !DRAG_TOOL_ENABLED.with(|state| *state.borrow())
+                    && !STRETCH_TOOL_ENABLED.with(|state| *state.borrow())
                 {
                     fib_level_hit_test(
                         crosshair_x as f64,
@@ -4795,10 +4851,10 @@ mod web_app {
                 let fib_line_hover = fib_hover_level.is_some();
                 if fib_line_hover {
                     set_chart_cursor("ns-resize");
-                } else if DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
-                    set_chart_cursor("move");
+                } else if STRETCH_TOOL_ENABLED.with(|state| *state.borrow()) {
+                    set_chart_cursor("ns-resize");
                 } else {
-                    set_chart_cursor("default");
+                    set_chart_cursor("grab");
                 }
 
                 // Reveal a trash icon over the figure under the cursor (only when no
@@ -4806,7 +4862,7 @@ mod web_app {
                 let tools_active = event.shift_key()
                     || measure_enabled
                     || fib_line_hover
-                    || DRAG_TOOL_ENABLED.with(|state| *state.borrow())
+                    || STRETCH_TOOL_ENABLED.with(|state| *state.borrow())
                     || FIB_STATE.with(|state| state.borrow().enabled)
                     || LINE_TOOL_ENABLED.with(|state| *state.borrow());
                 if tools_active {
@@ -4955,7 +5011,7 @@ mod web_app {
             let offset_x = event.offset_x() as f64;
             let offset_y = event.offset_y() as f64;
             let fib_drag_level =
-                if !event.shift_key() && !DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
+                if !event.shift_key() && !STRETCH_TOOL_ENABLED.with(|state| *state.borrow()) {
                     fib_level_hit_test(offset_x, offset_y, plot_left, plot_right, plot_top, plot_bottom)
                 } else {
                     None
@@ -5099,7 +5155,19 @@ mod web_app {
                 });
                 set_chart_cursor("grabbing");
                 set_status("Pan mode: move mouse left/right");
-            } else if DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
+            } else if STRETCH_TOOL_ENABLED.with(|state| *state.borrow()) {
+                if offset_y >= plot_top && offset_y <= plot_bottom {
+                    let start_factor = Y_STRETCH_FACTOR.with(|state| *state.borrow());
+                    Y_STRETCH_DRAG.with(|state| {
+                        *state.borrow_mut() = Some(YStretchDrag {
+                            start_y: event.offset_y(),
+                            start_factor,
+                        });
+                    });
+                    set_chart_cursor("ns-resize");
+                    set_status("Y stretch: drag up or down");
+                }
+            } else {
                 let offset_x = event.offset_x() as f64;
                 if offset_x >= plot_left
                     && offset_x <= plot_right
@@ -5133,19 +5201,7 @@ mod web_app {
                         });
                     });
                     set_chart_cursor("grabbing");
-                    set_status("Drag tool: pan X and Y");
-                }
-            } else {
-                if offset_y >= plot_top && offset_y <= plot_bottom {
-                    let start_factor = Y_STRETCH_FACTOR.with(|state| *state.borrow());
-                    Y_STRETCH_DRAG.with(|state| {
-                        *state.borrow_mut() = Some(YStretchDrag {
-                            start_y: event.offset_y(),
-                            start_factor,
-                        });
-                    });
-                    set_chart_cursor("ns-resize");
-                    set_status("Y stretch: drag up or down");
+                    set_status("Drag: pan X and Y");
                 }
             }
         }) as Box<dyn FnMut(MouseEvent)>);
@@ -5166,11 +5222,9 @@ mod web_app {
                     *state.borrow_mut() = 0.0;
                 });
             }
-            let chart_drag_finished = CHART_DRAG.with(|state| state.borrow_mut().take().is_some());
             let fib_line_drag_finished = FIB_LEVEL_DRAG.with(|state| state.borrow_mut().take());
-            Y_STRETCH_DRAG.with(|state| {
-                *state.borrow_mut() = None;
-            });
+            CHART_DRAG.with(|state| state.borrow_mut().take());
+            let stretch_finished = Y_STRETCH_DRAG.with(|state| state.borrow_mut().take()).is_some();
             let measure_finished = MEASURE_STATE.with(|state| {
                 let mut cfg = state.borrow_mut();
                 if cfg.enabled {
@@ -5203,19 +5257,14 @@ mod web_app {
                 ));
                 set_hover_info(&format!("Price %: {label} | price {price_label}"));
             }
-            if chart_drag_finished && DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
-                DRAG_TOOL_ENABLED.with(|state| {
+            if stretch_finished {
+                STRETCH_TOOL_ENABLED.with(|state| {
                     *state.borrow_mut() = false;
                 });
-                if let Err(err) = sync_drag_button() {
-                    set_status(&format!("failed: {:?}", err));
-                    return;
-                }
-                set_status("Drag tool disabled after pan");
-            } else if DRAG_TOOL_ENABLED.with(|state| *state.borrow()) {
-                set_chart_cursor("move");
+                let _ = sync_stretch_button();
+                set_status("Drag mode active (default)");
             } else if let Some(level) = fib_line_drag_finished {
-                set_chart_cursor("default");
+                set_chart_cursor("grab");
                 persist_current_pair_drawings();
                 sync_drawings_panel();
                 if let Some(price) = finished_fib_level_price(level) {
@@ -5223,8 +5272,10 @@ mod web_app {
                     set_status(&format!("{label} fixed at {:.2}", price));
                     set_fib_popup_info(&format!("{label} moved to {:.2}", price));
                 }
+            } else if STRETCH_TOOL_ENABLED.with(|state| *state.borrow()) {
+                set_chart_cursor("ns-resize");
             } else {
-                set_chart_cursor("default");
+                set_chart_cursor("grab");
             }
         }) as Box<dyn FnMut(MouseEvent)>);
 

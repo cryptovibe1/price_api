@@ -346,7 +346,7 @@
         stroke-linejoin: round;
       }
 
-      #drag-toggle {
+      #stretch-toggle {
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -356,13 +356,13 @@
         border: 1px solid var(--line);
       }
 
-      #drag-toggle.active {
+      #stretch-toggle.active {
         background: linear-gradient(180deg, #3e8ce6, #2f7dd8);
         color: #ffffff;
         border-color: transparent;
       }
 
-      #drag-toggle svg {
+      #stretch-toggle svg {
         width: 18px;
         height: 18px;
         stroke: currentColor;
@@ -399,6 +399,7 @@
       }
 
       #auto-fit,
+      #auto-mode-toggle,
       #flip-chart {
         display: inline-flex;
         align-items: center;
@@ -409,6 +410,7 @@
         border: 1px solid var(--line);
       }
 
+      #auto-mode-toggle.active,
       #flip-chart.active {
         background: linear-gradient(180deg, #3e8ce6, #2f7dd8);
         color: #ffffff;
@@ -416,6 +418,7 @@
       }
 
       #auto-fit svg,
+      #auto-mode-toggle svg,
       #flip-chart svg {
         width: 18px;
         height: 18px;
@@ -850,25 +853,20 @@
             <div class="tools-body">
               <div class="tool-grid">
                 <div class="tool-cell">
-                  <span class="tool-label">Drag</span>
+                  <span class="tool-label">Stretch</span>
                   <button
-                    id="drag-toggle"
+                    id="stretch-toggle"
                     class="toggle-btn"
                     type="button"
-                    aria-label="Drag Off"
-                    title="Drag Off"
+                    aria-label="Stretch Off"
+                    title="Stretch Off"
                   >
                     <svg viewBox="0 0 24 24" aria-hidden="true">
                       <path d="M12 3v18" />
-                      <path d="M3 12h18" />
                       <path d="m12 3-3 3" />
                       <path d="m12 3 3 3" />
                       <path d="m12 21-3-3" />
                       <path d="m12 21 3-3" />
-                      <path d="m3 12 3-3" />
-                      <path d="m3 12 3 3" />
-                      <path d="m21 12-3-3" />
-                      <path d="m21 12-3 3" />
                     </svg>
                   </button>
                 </div>
@@ -1090,6 +1088,26 @@
                 <path d="M21 9V3h-6" />
                 <path d="M3 15v6h6" />
                 <path d="M21 15v6h-6" />
+              </svg>
+            </button>
+          </div>
+          <div>
+            <label for="auto-mode-toggle">Auto</label>
+            <button
+              id="auto-mode-toggle"
+              class="toggle-btn"
+              type="button"
+              aria-label="Auto Off"
+              title="Auto Off"
+              aria-pressed="false"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M3 9V3h6" />
+                <path d="M21 9V3h-6" />
+                <path d="M3 15v6h6" />
+                <path d="M21 15v6h-6" />
+                <path d="M12 8v8" />
+                <path d="M8 12h8" />
               </svg>
             </button>
           </div>
